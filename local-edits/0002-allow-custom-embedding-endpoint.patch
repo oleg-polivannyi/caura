@@ -1,0 +1,29 @@
+diff --git a/common/embedding/_registry.py b/common/embedding/_registry.py
+index c9e5afa..d19049e 100644
+--- a/common/embedding/_registry.py
++++ b/common/embedding/_registry.py
+@@ -279,15 +279,15 @@ def get_embedding_provider(
+         # self-hosted endpoints reject the ``dimensions=`` SDK kwarg
+         # outright. Hosted ``api.openai.com`` is the only target that
+         # accepts (and requires) it.
+-        if base_url and send_dimensions:
+-            raise ValueError(
+-                f"OPENAI_EMBEDDING_BASE_URL={base_url!r} is set but "
+-                "OPENAI_EMBEDDING_SEND_DIMENSIONS is true. Most "
+-                "OpenAI-compatible self-hosted endpoints (TEI, vLLM, ...) "
+-                "reject the ``dimensions=`` kwarg. Set "
+-                "OPENAI_EMBEDDING_SEND_DIMENSIONS=false for TEI/vLLM, or "
+-                "remove OPENAI_EMBEDDING_BASE_URL to use hosted OpenAI."
+-            )
++#         if base_url and send_dimensions:
++#             raise ValueError(
++#                 f"OPENAI_EMBEDDING_BASE_URL={base_url!r} is set but "
++#                 "OPENAI_EMBEDDING_SEND_DIMENSIONS is true. Most "
++#                 "OpenAI-compatible self-hosted endpoints (TEI, vLLM, ...) "
++#                 "reject the ``dimensions=`` kwarg. Set "
++#                 "OPENAI_EMBEDDING_SEND_DIMENSIONS=false for TEI/vLLM, or "
++#                 "remove OPENAI_EMBEDDING_BASE_URL to use hosted OpenAI."
++#             )
+ 
+         # Inverse misconfiguration: hosted OpenAI (no ``base_url``) with
+         # ``send_dimensions=false``. Hosted ``api.openai.com`` honours

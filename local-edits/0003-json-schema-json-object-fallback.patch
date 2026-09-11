@@ -1,0 +1,44 @@
+diff --git a/common/llm/providers/openai.py b/common/llm/providers/openai.py
+index ab1bc68..8dbae06 100644
+--- a/common/llm/providers/openai.py
++++ b/common/llm/providers/openai.py
+@@ -167,7 +167,10 @@ class OpenAILLMProvider:
+         Pydantic-generated schemas don't always satisfy OpenAI's strict-
+         mode requirements (additionalProperties=false everywhere); the
+         client-side Pydantic parse is the real guardrail. Passing
+-        ``None`` preserves today's shape-less behaviour.
++        ``None`` preserves today's shape-less behaviour. If the endpoint
++        rejects ``json_schema`` with HTTP 400 instead of ignoring it
++        (Polza's DeepSeek route does), the call is retried once with
++        shape-less ``json_object``.
+         """
+         t0 = time.perf_counter()
+         if response_schema is not None:
+@@ -189,7 +192,26 @@ class OpenAILLMProvider:
+         }
+         if seed is not None:
+             create_kwargs["seed"] = seed
+-        response = await self._client.chat.completions.create(**create_kwargs)
++        try:
++            response = await self._client.chat.completions.create(**create_kwargs)
++        except openai.BadRequestError:
++            # Not every OpenAI-compatible endpoint honours the note above:
++            # some (e.g. Polza's DeepSeek route) reject
++            # ``response_format={"type": "json_schema"}`` with HTTP 400
++            # ("This response_format type is unavailable now" /
++            # "does not support 'json_schema' response format") instead of
++            # ignoring the kwarg. Fall back to shape-less ``json_object``
++            # once — the prompt still specifies the schema and the caller's
++            # Pydantic parse remains the real guardrail.
++            if response_format.get("type") != "json_schema":
++                raise
++            logger.warning(
++                "Provider rejected json_schema response_format for model %s; "
++                "retrying with json_object",
++                self._model,
++            )
++            create_kwargs["response_format"] = {"type": "json_object"}
++            response = await self._client.chat.completions.create(**create_kwargs)
+         llm_ms = int((time.perf_counter() - t0) * 1000)
+         logger.info(
+             "OpenAI-compatible complete_json (%s) took %dms",

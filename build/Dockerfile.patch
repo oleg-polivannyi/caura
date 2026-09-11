@@ -15,4 +15,4 @@ FROM memclaw-core-api:v5
 COPY --chown=appuser:appuser app/ /app/
 
 # Drop any bytecode caches so the patched sources are recompiled at startup.
-RUN find /app -type d -name __pycache__ -prune -exec rm -rf {} + || true
+RUN find /app -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

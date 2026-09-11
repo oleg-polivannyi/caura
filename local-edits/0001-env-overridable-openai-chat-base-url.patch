@@ -1,0 +1,13 @@
+diff --git a/common/llm/constants.py b/common/llm/constants.py
+index 7f9edc1..6baf30f 100644
+--- a/common/llm/constants.py
++++ b/common/llm/constants.py
+@@ -18,7 +18,7 @@ GEMINI_DEFAULT_MODEL = os.environ.get(
+ # OpenAI's chat-completions base URL — used by ``OpenAILLMProvider``
+ # (and for openrouter / anthropic compat where the API mirrors OpenAI's
+ # shape, with the base URL swapped via tenant-config override).
+-OPENAI_CHAT_BASE_URL = "https://api.openai.com/v1"
++OPENAI_CHAT_BASE_URL = os.environ.get("OPENAI_CHAT_BASE_URL", "https://api.openai.com/v1")
+ 
+ # Anthropic + OpenRouter base URLs and default models. The
+ # ``OpenAILLMProvider`` works against any of these endpoints by varying
