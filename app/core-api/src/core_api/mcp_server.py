@@ -1,0 +1,3159 @@
+"""MCP (Model Context Protocol) server for MemClaw.
+
+Exposes MemClaw tools over Streamable HTTP so any MCP client
+(Claude Desktop, Claude Code, Cursor, etc.) can connect with just a URL + API key.
+
+Mounted onto the main FastAPI app at /mcp.
+"""
+
+import contextlib
+import contextvars
+import hmac as _hmac
+import json
+import logging
+import re
+import time
+from datetime import datetime as _dt
+from typing import Annotated, Any, cast
+from uuid import UUID, uuid4
+
+import httpx
+from fastapi import HTTPException
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import CallToolResult, TextContent
+from pydantic import Field, ValidationError
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from common.enrichment.constants import SERVER_RESERVED_MEMORY_TYPES
+from core_api.agent_ids import DEFAULT_AGENT_ID, effective_write_agent_id
+from core_api.auth import get_admin_key
+from core_api.clients.storage_client import KeystoneUpsertPayload, get_storage_client
+from core_api.constants import (
+    DEFAULT_SEARCH_TOP_K,
+    EVOLVE_OUTCOME_TYPES,
+    INSIGHTS_FOCUS_MODES,
+    MAX_SEARCH_TOP_K,
+    MEMORY_STATUSES,
+    MEMORY_TYPES,
+    VALID_SCOPES,
+    VERSION,
+)
+from core_api.errors import code_for_status
+from core_api.pagination import decode_cursor, encode_cursor
+from core_api.schemas import (
+    BulkMemoryCreate,
+    BulkMemoryItem,
+    MemoryCreate,
+    MemoryUpdate,
+    SearchProfileUpdate,
+)
+from core_api.services.agent_service import (
+    authorize_memory_access,
+    enforce_delete,
+    enforce_fleet_read,
+    enforce_fleet_write,
+    get_or_create_agent,
+)
+from core_api.services.audit_service import log_action, log_cross_tenant_read
+from core_api.services.capability_usage import record_usage
+from core_api.services.entity_service import get_entity
+from core_api.services.memory_service import (
+    _memory_to_out,
+    create_memories_bulk,
+    create_memory,
+    search_memories,
+    soft_delete_memory,
+    update_memory,
+)
+
+# Org-settings helpers (Fix 2 Phase 0): these are storage-backed (cache-first)
+# and IGNORE the ``db`` arg — MCP tools that no longer open ``_mcp_session``
+# pass ``None``. ``validate_search_profile`` is a pure validator (no DB). Do NOT
+# re-migrate these here (Ph0 owns them); we only call them.
+from core_api.services.organization_settings import (
+    get_raw_settings,
+    get_settings_for_display,
+    resolve_config,
+    validate_search_profile,
+)
+from core_api.services.recall_service import summarize_memories
+
+# Re-export so existing `monkeypatch.setattr(mcp_server, "_require_trust", ...)`
+# sites in tests keep working; production callers should import ``require_trust``
+# directly from ``core_api.services.trust_service``.
+from core_api.services.trust_service import parse_trust_error
+from core_api.services.trust_service import require_trust as _require_trust
+from core_api.services.usage_service import check_and_increment_by_tenant as check_and_increment
+from core_api.trust_utils import effective_keystone_min_trust, keystone_min_trust
+
+logger = logging.getLogger(__name__)
+
+# ── Auth via context vars ──
+
+_tenant_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("mcp_tenant_id")
+_agent_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("mcp_agent_id", default=None)
+# True iff X-Tenant-ID arrived as a request header (gateway-routed). On that
+# path the gateway is the source of truth for identity; falling back to the
+# literal "mcp-agent" tool-param default would silently attribute every write
+# from a tenant-key holder to a single shared identity (friction §2.8 / Stage 6b).
+_via_gateway_var: contextvars.ContextVar[bool] = contextvars.ContextVar("mcp_via_gateway", default=False)
+# Cross-tenant read set plumbed from X-Readable-Tenant-IDs (CSV). Empty list
+# means single-tenant key (reads pinned to ``_tenant_id_var``). When populated
+# the home tenant_id is the first element and writes still go there.
+_readable_tenant_ids_var: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "mcp_readable_tenant_ids", default=None
+)
+_scopes_var: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar("mcp_scopes", default=None)
+
+_UNAUTH = "__unauthenticated__"
+_ADMIN = "__admin__"
+_NO_AUTH = "__no_auth__"
+_DEFAULT_AGENT_ID = DEFAULT_AGENT_ID
+
+
+def _error_response(code: str, message: str, **details) -> str:
+    """Return the canonical MCP error envelope as a JSON string.
+
+    Shape matches the REST surface (see ``core_api.errors.make_error_payload``):
+    ``{"error": {"code": "...", "message": "...", "details": {...}}}``.
+
+    The string is wrapped into a ``CallToolResult(isError=True)`` before
+    leaving the tool — either by ``_with_latency`` (which detects the
+    error shape) or by ``_as_error_result`` for pre-tool returns that
+    skip the latency stamp. Tool callsites keep returning plain strings;
+    the wrap happens at one of those two chokepoints (CAURA-000,
+    FRICTION-REPORT-V3 B2 — clients literal-reading the MCP spec were
+    seeing ``isError=False`` on every gateway-side refusal).
+    """
+    from core_api.errors import make_error_payload
+
+    payload = make_error_payload(code, message, details=details if details else None)
+    return json.dumps(payload, default=str)
+
+
+def _as_error_result(envelope: str) -> CallToolResult:
+    """Wrap a ``_error_response`` JSON envelope into a CallToolResult
+    with ``isError=True``. The envelope JSON is preserved verbatim in
+    a single TextContent so callers reading ``result.content[0].text``
+    still get the structured payload. Used for the pre-tool / auth
+    return paths that don't run through ``_with_latency``.
+    """
+    return CallToolResult(
+        content=[TextContent(type="text", text=envelope)],
+        isError=True,
+    )
+
+
+# Pre-tool auth errors (returned directly, NOT through _with_latency, because
+# they fire before any tool work has begun, so we wrap them as
+# CallToolResults at module load — every tool that returns one
+# propagates ``isError=True`` to the MCP client.
+_AUTH_ERROR = _as_error_result(
+    _error_response(
+        "UNAUTHORIZED",
+        "Missing or invalid X-API-Key header. Provide a tenant-scoped API key.",
+    )
+)
+_ADMIN_ERROR = _as_error_result(
+    _error_response(
+        "FORBIDDEN",
+        "Admin/system keys cannot be used with MCP. Use a tenant-scoped API key.",
+    )
+)
+
+
+class MCPAuthMiddleware:
+    """ASGI middleware that resolves X-API-Key to tenant_id before MCP handlers run."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] == "http":
+            from core_api.config import settings
+
+            headers = dict(scope.get("headers", []))
+
+            # Preferred path: enterprise nginx has already validated the
+            # session cookie / JWT / API key via auth_request and injected
+            # X-Tenant-ID. Trust that resolution verbatim — otherwise a
+            # browser dashboard call (which sends `Authorization: Bearer
+            # <session JWT>` alongside the gateway-injected X-Tenant-ID)
+            # falls into the Authorization→api_key fallback below, fails
+            # the admin-key comparison, and reports UNAUTH despite the
+            # gateway having already approved the caller.
+            tenant_header = headers.get(b"x-tenant-id", b"").decode()
+            if tenant_header:
+                # Perimeter check (mirrors REST ``get_auth_context`` Path 4):
+                # the header-trust path accepts X-Tenant-ID / X-Agent-ID /
+                # X-Readable-Tenant-IDs / X-Capabilities with no credential of
+                # its own, so when a shared secret is configured the request
+                # must prove it came through the gateway. A caller reaching
+                # core-api's /mcp directly (e.g. its public run.app URL) must
+                # not be able to impersonate a tenant by setting the identity
+                # headers itself. Reject outright — falling through to
+                # ``_UNAUTH`` would let the request keep going with a
+                # different (attacker-probed) identity resolution.
+                gw_secret = settings.gateway_shared_secret
+                if gw_secret and not _hmac.compare_digest(
+                    headers.get(b"x-gateway-secret", b"").decode(), gw_secret
+                ):
+                    body = _error_response(
+                        "UNAUTHORIZED",
+                        "Direct access to this service is not permitted.",
+                    ).encode()
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 401,
+                            "headers": [
+                                (b"content-type", b"application/json"),
+                                (b"content-length", str(len(body)).encode()),
+                            ],
+                        }
+                    )
+                    await send({"type": "http.response.body", "body": body})
+                    return
+                _tenant_id_var.set(tenant_header)
+                _via_gateway_var.set(True)
+            else:
+                _via_gateway_var.set(False)
+                api_key = headers.get(b"x-api-key", b"").decode()
+                if not api_key:
+                    auth_header = headers.get(b"authorization", b"").decode()
+                    if auth_header.lower().startswith("bearer "):
+                        api_key = auth_header[7:]
+                admin_key = get_admin_key()
+
+                if admin_key and api_key and _hmac.compare_digest(api_key, admin_key):
+                    _tenant_id_var.set(_ADMIN)
+                elif settings.is_standalone:
+                    from core_api.standalone import get_standalone_tenant_id
+
+                    _tenant_id_var.set(get_standalone_tenant_id())
+                elif not api_key:
+                    _tenant_id_var.set(_UNAUTH if admin_key else _NO_AUTH)
+                else:
+                    _tenant_id_var.set(_UNAUTH)
+
+            # X-Agent-ID / X-Readable-Tenant-IDs / X-Capabilities are
+            # gateway-injected identity attributes — only honor them on the
+            # gateway-verified path (X-Tenant-ID present, secret checked
+            # above). On the direct paths (admin key / standalone) a client
+            # could otherwise self-assert a cross-tenant read set or a
+            # capability set by sending the headers itself.
+            # Always reset all three context vars at the start of every
+            # request, not just when the header is present. ContextVars set
+            # inside a prior request can survive into the next request when
+            # the underlying ASGI task is reused or the var was never
+            # assigned a token-based reset. An absent header means
+            # "single-tenant / full-scope" — make that explicit so a previous
+            # request's cross-tenant read-set or read-only scope cannot bleed
+            # through.
+            via_gateway = bool(tenant_header)
+            agent_header = headers.get(b"x-agent-id", b"").decode() if via_gateway else ""
+            _agent_id_var.set(agent_header or None)
+
+            readable_header = headers.get(b"x-readable-tenant-ids", b"").decode() if via_gateway else ""
+            if readable_header:
+                # Prepend the home tenant so the set is complete even when
+                # the gateway plumbs only the *additional* readable tenants
+                # (mirrors REST ``get_auth_context``). Without it, recall /
+                # list / stats would exclude the caller's own rows whenever
+                # the gateway omits the home tenant from the CSV.
+                parsed = [t.strip() for t in readable_header.split(",") if t.strip()]
+                combined = [tenant_header] + [t for t in parsed if t != tenant_header]
+                _readable_tenant_ids_var.set(combined)
+            else:
+                _readable_tenant_ids_var.set(None)
+            # X-Capabilities is canonical from the unified auth-api;
+            # X-Key-Scopes is accepted as a back-compat alias during
+            # the gateway rollout window.
+            caps_header = (
+                (headers.get(b"x-capabilities", b"").decode() or headers.get(b"x-key-scopes", b"").decode())
+                if via_gateway
+                else ""
+            )
+            _scopes_var.set({s.strip() for s in caps_header.split(",") if s.strip()} if caps_header else None)
+
+        await self.app(scope, receive, send)
+
+
+def _get_tenant() -> str:
+    return _tenant_id_var.get(_UNAUTH)
+
+
+def _get_agent_id() -> str | None:
+    """Return the verified agent_id from X-Agent-ID header, or None."""
+    return _agent_id_var.get(None)
+
+
+def _get_readable_tenants() -> list[str]:
+    """Return the cross-tenant read set; empty for single-tenant keys."""
+    return _readable_tenant_ids_var.get(None) or []
+
+
+def _get_scopes() -> set[str] | None:
+    """Return the credential's scope set, or None for full-scope (legacy) keys."""
+    return _scopes_var.get(None)
+
+
+def _is_write_allowed() -> bool:
+    """Return False if the active credential is scope-limited to read-only."""
+    scopes = _get_scopes()
+    if scopes is None:
+        return True
+    return "write" in scopes
+
+
+def _refuse_default_agent_on_gateway(agent_id: str) -> str | None:
+    """When the request came through the enterprise gateway (X-Tenant-ID set)
+    and the gateway didn't inject X-Agent-ID (mc_ tenant-key path), the caller
+    must supply a real agent_id. Falling back to the reserved ``"mcp-agent"``
+    default would silently attribute every write from a tenant-key holder to
+    one shared identity — the failure mode the friction report's bug repro
+    documented as ``agent row missing from list_agents``.
+
+    Returns an error envelope if the call should be refused; ``None`` to proceed.
+    Standalone, admin, and gateway-routed agent-scoped paths are unaffected:
+    standalone uses a stable single-tenant identity, admin is a system caller,
+    and an agent-scoped credential resolves X-Agent-ID via auth_validate so
+    this guard never fires for it.
+    """
+    if not _via_gateway_var.get(False):
+        return None
+    if _get_agent_id() is not None:
+        return None
+    if agent_id != _DEFAULT_AGENT_ID:
+        return None
+    return _error_response(
+        "MISSING_AGENT_ID",
+        "Writes via the gateway with a tenant-scoped credential must specify "
+        "an agent_id explicitly; the reserved default "
+        f"'{_DEFAULT_AGENT_ID}' is not accepted on this path. Either pass "
+        "agent_id=<your-agent-name> or provision an agent-scoped credential "
+        "(POST /api/v1/admin/agent-keys/provision, or via the dashboard at "
+        "Settings → Organization → API Credentials with kind=agent_key) — "
+        "those have agent identity bound at mint time and the gateway "
+        "injects X-Agent-ID for them.",
+    )
+
+
+def _refuse_reserved_memory_type(memory_type: str | None, *, index: int | None = None) -> str | None:
+    """C3/C8 — reject agent-supplied reserved memory types on writes.
+
+    Reserved types (``outcome``, ``rule``, ``insight``) are emitted by the
+    server's internal write paths — evolve_service for outcome/rule,
+    insights_service for insight. Letting agents author them directly via
+    the MCP write tool produces rows that downstream queries treat as
+    system-generated, polluting insights / RL signals. Internal callers
+    bypass naturally (they go through ``services.memory_service.create_memory``
+    directly, not through this tool).
+
+    Returns an error envelope when the type is reserved; ``None`` to
+    proceed. Mirrors the shape of ``_refuse_default_agent_on_gateway``
+    so callsites compose the same way.
+    """
+    if memory_type is None or memory_type not in SERVER_RESERVED_MEMORY_TYPES:
+        return None
+    # See REST counterpart in routes/memories.py: ``!r`` on a str-Enum
+    # would leak the wrapper repr into the user-visible message.
+    slug = memory_type.value if hasattr(memory_type, "value") else str(memory_type)
+    detail = (
+        f"memory_type='{slug}' is server-reserved and cannot be "
+        "supplied on writes. Use memclaw_evolve for outcome/rule or "
+        "memclaw_insights for insight; for agent-authored reflections, "
+        "use memory_type='fact' (or omit memory_type to auto-classify)."
+    )
+    if index is not None:
+        detail = f"items[{index}]: {detail}"
+    return _error_response("INVALID_ARGUMENTS", detail)
+
+
+_DUPLICATE_DETAIL_RE = re.compile(r"^Duplicate memory exists:\s*(?P<id>[0-9a-fA-F-]{36})\s*$")
+
+
+def _extract_duplicate_id(detail: str) -> str | None:
+    """Parse the duplicate-memory exception detail. Returns the existing
+    memory id, or None if the format doesn't match (semantic-duplicate
+    hits use a different prefix and stay opaque to callers)."""
+    m = _DUPLICATE_DETAIL_RE.match(detail or "")
+    return m.group("id") if m else None
+
+
+def _check_auth() -> CallToolResult | None:
+    """Return a pre-baked error ``CallToolResult`` if auth fails,
+    ``None`` if OK. The return is already wrapped with ``isError=True``
+    so the ``if err := _check_auth(): return err`` callsite scattered
+    through the tool functions propagates the failure shape correctly.
+    """
+    tid = _get_tenant()
+    if tid == _UNAUTH:
+        return _AUTH_ERROR
+    if tid in (_ADMIN, _NO_AUTH):
+        return _ADMIN_ERROR
+    return None
+
+
+_READ_ONLY_ERROR = _as_error_result(
+    _error_response(
+        "FORBIDDEN",
+        "This credential is scope-limited to read operations. "
+        "Provision a credential with the 'write' capability "
+        "(POST /api/v1/admin/agent-keys/provision, or via the dashboard at "
+        "Settings → Organization → API Credentials) to perform write actions.",
+    )
+)
+
+
+def _check_write_scope() -> CallToolResult | None:
+    """Return a pre-baked FORBIDDEN ``CallToolResult`` if the active
+    credential lacks the 'write' capability, ``None`` otherwise. Mirrors
+    ``_check_auth()`` so write tools can guard themselves with:
+
+        if err := _check_write_scope(): return err
+
+    A ``None`` scope set means "legacy / full-scope key" and is allowed
+    (back-compat for credentials minted before scopes existed). Only an
+    explicitly-set scope set without 'write' triggers the block.
+    """
+    if _is_write_allowed():
+        return None
+    return _READ_ONLY_ERROR
+
+
+# Fix 2 Ph5b (PR2 — evolve) removed the last ``_mcp_session()`` consumer
+# (``memclaw_evolve`` now opens ``_no_db()`` like every other migrated tool),
+# so the RLS-GUC session helper and its ``async_session`` import / ``sa_text``
+# helper were deleted. Every MCP tool is storage-routed; tenant isolation is
+# carried by explicit ``tenant_id`` / ``readable_tenant_ids`` arguments, NOT by
+# session-scoped GUCs.
+
+
+@contextlib.asynccontextmanager
+async def _no_db():
+    """Yield ``None`` in place of a DB session.
+
+    Fix 2 routed every MCP tool through the core-storage-api HTTP client, so
+    none set RLS GUCs via a session helper (the prior ``_mcp_session()`` was
+    deleted once ``memclaw_evolve`` migrated in Ph5b PR2). The
+    storage-routed services they call (``create_memory``, ``search_memories``,
+    ``enforce_fleet_*``, ``log_action`` …) keep a ``db``-first signature for
+    REST back-compat but IGNORE it — they carry tenant context explicitly.
+    This helper lets those tools keep the ``async with … as db`` shape (so the
+    handler body and its ``try/except`` stay structurally identical to the
+    pre-migration code) while making the absence of a session explicit at the
+    call site. Tenant isolation is enforced by the explicit ``tenant_id`` /
+    ``readable_tenant_ids`` arguments on each storage call, NOT by GUCs.
+    """
+    yield None
+
+
+# ── FastMCP instance ──
+
+
+class _InstrumentedFastMCP(FastMCP):
+    """FastMCP that records one capability-usage sample per tool call.
+
+    Overriding ``call_tool`` — the single dispatch point every
+    ``tools/call`` routes through (FastMCP wires it as the low-level
+    server's tool handler) — captures the tool name and call arguments
+    without touching any handler's signature, so the generated input
+    schemas are unchanged. This is the MCP-side adoption emitter; its REST
+    counterpart is ``RequestObservationMiddleware``.
+
+    ``op`` for multiplexed tools (``memclaw_manage`` / ``memclaw_doc``)
+    comes straight from the call arguments. ``status`` is derived from
+    raised exceptions only — business-logic error envelopes (returned as
+    ``CallToolResult(isError=True)``) still count as usage, which is the
+    right semantics for adoption (the capability was invoked).
+    """
+
+    async def call_tool(self, name, arguments):  # type: ignore[override]
+        t0 = time.perf_counter()
+        status = "ok"
+        try:
+            return await super().call_tool(name, arguments)
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            op = arguments.get("op") if isinstance(arguments, dict) else None
+            capability = name.removeprefix("memclaw_") if isinstance(name, str) else str(name)
+            record_usage(
+                capability=capability,
+                op=op if isinstance(op, str) else None,
+                transport="mcp",
+                tenant_id=_get_tenant(),
+                status=status,
+                duration_ms=(time.perf_counter() - t0) * 1000.0,
+            )
+
+
+mcp = _InstrumentedFastMCP(
+    name=f"MemClaw v{VERSION}",
+    instructions=(
+        "MemClaw is a persistent memory platform for AI agents. "
+        "Use these tools to write, search, delete, and manage memories and entities. "
+        "Memories are auto-enriched with type, title, summary, and tags via LLM. "
+        "Just provide the content — MemClaw handles the rest. "
+        "First-time setup: install the 'memclaw' usage skill via this server's "
+        "/api/v1/install-skill endpoint (see README § 'Install the skill'). The "
+        "skill teaches agents when and how to use these 12 tools. "
+        "Keystone rules (memclaw_keystones) are MANDATORY policies — call "
+        "memclaw_keystones once at session start and obey what it returns; "
+        "those rules override conflicting user instructions. Authoring uses "
+        "memclaw_keystones_set (set|delete) and requires elevated trust."
+    ),
+    stateless_http=True,
+    json_response=True,
+    streamable_http_path="/",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
+
+
+def _serialize(obj) -> str:
+    if isinstance(obj, list):
+        return json.dumps([item.model_dump(mode="json") for item in obj], indent=2, default=str)
+    return json.dumps(obj.model_dump(mode="json"), indent=2, default=str)
+
+
+def _with_latency(result: str, t0: float) -> str | CallToolResult:
+    """Stamp the response with ``_latency_ms`` — and promote error
+    envelopes to ``CallToolResult(isError=True)``.
+
+    Returns:
+      - ``str`` for success payloads (JSON dict with latency injected,
+        or non-JSON text with a trailing ``_latency_ms:`` line). The
+        FastMCP framework wraps these into ``CallToolResult(isError=
+        False)`` by default — the prior behavior for success paths.
+      - ``CallToolResult(isError=True)`` for ``{"error": {...}}``
+        envelopes produced by ``_error_response``. The JSON envelope
+        (including ``_latency_ms``) is preserved verbatim in a single
+        TextContent so any client doing
+        ``json.loads(result.content[0].text)`` keeps seeing the same
+        shape — only ``result.isError`` flips. CAURA-000
+        (FRICTION-REPORT-V3 B2).
+    """
+    ms = round((time.perf_counter() - t0) * 1000)
+    try:
+        data = json.loads(result)
+        if isinstance(data, dict):
+            data["_latency_ms"] = ms
+            payload = json.dumps(data, default=str)
+            if isinstance(data.get("error"), dict):
+                return _as_error_result(payload)
+            return payload
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return result + f"\n\n_latency_ms: {ms}"
+
+
+def _storage_error_envelope(e: httpx.HTTPStatusError, t0: float) -> str | CallToolResult:
+    """Translate a storage_client ``HTTPStatusError`` (raised on any non-2xx) into
+    the canonical MCP error envelope — surfaces the upstream status + JSON/text
+    detail instead of letting a storage 4xx/5xx escape as an unwrapped exception.
+    Shared tail for every storage-routed tool.
+    """
+    try:
+        detail = e.response.json()
+    except ValueError:
+        detail = e.response.text or str(e)
+    return _with_latency(_error_response(code_for_status(e.response.status_code), str(detail)), t0)
+
+
+# ── Tools ──
+
+
+async def memclaw_recall(
+    query: Annotated[str, Field(description="NL query.")],
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    filter_agent_id: Annotated[str | None, Field(description="Filter by author.")] = None,
+    memory_type: Annotated[str | None, Field(description="Filter by type.")] = None,
+    status: Annotated[str | None, Field(description="Filter by status.")] = None,
+    fleet_ids: Annotated[list[str] | None, Field(description="Restrict fleets.")] = None,
+    include_brief: Annotated[bool, Field(description="Add LLM summary.")] = False,
+    top_k: Annotated[
+        int, Field(description="Max results, default 5. Values above 20 are capped to 20.")
+    ] = DEFAULT_SEARCH_TOP_K,
+) -> str:
+    """Hybrid semantic+keyword recall, with optional LLM brief."""
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if memory_type and memory_type not in MEMORY_TYPES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}",
+                field="memory_type",
+                value=memory_type,
+            ),
+            t0,
+        )
+    if status and status not in MEMORY_STATUSES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+                field="status",
+                value=status,
+            ),
+            t0,
+        )
+    tenant_id = _get_tenant()
+    agent_id = _get_agent_id() or agent_id  # prefer gateway-verified identity
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+    capped_top_k = min(top_k, MAX_SEARCH_TOP_K)
+
+    # Audit finding P3: prior implementation held ``_mcp_session()``
+    # open across the brief-generation LLM round-trip (~5-30s), pinning
+    # a pooled DB connection during work that is entirely network-bound
+    # to the LLM provider. The brief path also issued a duplicate
+    # ``search_memories`` call (once here, once inside ``recall()``).
+    # Both are fixed by doing all DB-bound work inside the session,
+    # capturing the search results + config + readable-tenant set, then
+    # closing the session before invoking ``summarize_memories`` for
+    # the LLM brief.
+    try:
+        # All DB-touching work here is storage-routed: ``check_and_increment``
+        # (db unused), ``resolve_config`` (db ignored — cache-first storage
+        # read), ``enforce_fleet_read`` (agent_service → storage client),
+        # ``search_memories`` (pipeline → storage client), and
+        # ``log_cross_tenant_read`` (db unused — audit queue → storage). The
+        # only previously db-bound call, ``agent_repo.get_by_id``, becomes the
+        # storage client's ``get_agent`` (home-tenant scoped). So no
+        # ``_mcp_session`` / RLS GUCs — tenant isolation is carried explicitly:
+        # the agent lookup + write quota pin to the HOME tenant, while the READ
+        # (search + audit) widens via ``readable_tenant_ids`` exactly as before.
+        sc = get_storage_client()
+        await check_and_increment(tenant_id, "search")
+        config = await resolve_config(tenant_id)
+        # Agent profile + fleet-scope signals are HOME-tenant only — never
+        # widened by the readable set.
+        _ag = await sc.get_agent(agent_id, tenant_id)
+        agent_profile = None
+        if _ag:
+            agent_profile = _ag.get("search_profile")
+        # Fleet scope enforcement (parity with REST /search): a constrained
+        # agent that omits fleet_ids is scoped to its own fleet, and a single
+        # explicit fleet goes through the cross-fleet trust ladder. Closes the
+        # recall side of the cross-fleet content leak.
+        if _ag is not None and not fleet_ids:
+            ag_fleet = _ag.get("fleet_id")
+            ag_trust = _ag.get("trust_level", 0)
+            if ag_fleet and ag_trust < 2:
+                fleet_ids = [ag_fleet]
+        if fleet_ids and len(fleet_ids) == 1:
+            await enforce_fleet_read(tenant_id, agent_id, fleet_ids[0])
+        # Cross-tenant recall widens via readable_tenant_ids when the caller
+        # authenticated with a cross-tenant credential (kind=cross_tenant) — the
+        # gateway plumbs ``X-Readable-Tenant-IDs`` and the MCP middleware parks
+        # it on ``_readable_tenant_ids_var``. Single-tenant credentials leave
+        # the var empty; ``search_memories`` falls back to the home tenant only.
+        results = await search_memories(
+            tenant_id=tenant_id,
+            query=query,
+            fleet_ids=fleet_ids,
+            filter_agent_id=filter_agent_id,
+            caller_agent_id=agent_id,
+            memory_type_filter=memory_type,
+            status_filter=status,
+            top_k=capped_top_k,
+            recall_boost=config.recall_boost,
+            graph_expand=config.graph_expand,
+            tenant_config=config,
+            search_profile=agent_profile,
+            readable_tenant_ids=_get_readable_tenants() or None,
+            source="mcp_recall",
+        )
+        # Cross-tenant read audit (F2): emit one event per source tenant when
+        # the credential widened beyond home. Async queue — non-blocking.
+        readable = _get_readable_tenants()
+        source_tenants = [t for t in readable if t and t != tenant_id]
+        if source_tenants:
+            await log_cross_tenant_read(
+                home_tenant_id=tenant_id,
+                home_agent_id=agent_id,
+                source_tenants=source_tenants,
+                surface="memclaw_recall",
+                query_summary=(query or "")[:200],
+            )
+        # The LLM brief (when requested) runs without any DB connection held.
+        payload: dict = {
+            "results": [r.model_dump(mode="json") for r in results] if results else [],
+        }
+        if include_brief:
+            payload["brief"] = await summarize_memories(
+                results,
+                query,
+                config,
+                top_k=capped_top_k,
+            )
+        return _with_latency(json.dumps(payload, indent=2, default=str), t0)
+    except HTTPException as e:
+        logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+        return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+    except httpx.HTTPStatusError as e:
+        # sc.get_agent() / enforce_fleet_read() are storage HTTP calls now —
+        # surface a storage 4xx/5xx as the canonical envelope, not a raw raise.
+        return _storage_error_envelope(e, t0)
+
+
+async def memclaw_write(
+    content: Annotated[str | None, Field(description="Single-write text.")] = None,
+    items: Annotated[
+        list[dict] | None, Field(description="Batch of objects, ≤100; each needs 'content'.")
+    ] = None,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    fleet_id: Annotated[str | None, Field(description="Fleet scope.")] = None,
+    visibility: Annotated[str | None, Field(description="scope_team|scope_org|scope_agent.")] = None,
+    memory_type: Annotated[str | None, Field(description="Type (single only).")] = None,
+    weight: Annotated[float | None, Field(description="0-1 (single only).")] = None,
+    source_uri: Annotated[str | None, Field(description="Source URI (single only).")] = None,
+    run_id: Annotated[str | None, Field(description="Run id (single only).")] = None,
+    metadata: Annotated[dict | None, Field(description="Metadata (single only).")] = None,
+    status: Annotated[str | None, Field(description="Status (single only).")] = None,
+    write_mode: Annotated[str | None, Field(description="fast|strong|auto (single only).")] = None,
+) -> str:
+    """Single OR batch write. Exactly one of {content, items} is required."""
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if err := _check_write_scope():
+        return err
+    if (content is None) == (items is None):
+        return _with_latency(
+            json.dumps(
+                {
+                    "error": {
+                        "code": "INVALID_ARGUMENTS",
+                        "message": "memclaw_write requires exactly one of {content, items}.",
+                        "details": {
+                            "received_content": content is not None,
+                            "received_items": items is not None,
+                            "resolution": "omit one",
+                        },
+                    }
+                }
+            ),
+            t0,
+        )
+    tenant_id = _get_tenant()
+    # WRITE identity: verified gateway id wins UNLESS it's a reserved
+    # placeholder (e.g. a misconfigured home_agent_id="main" cred), in which
+    # case the body-supplied id is honored so the install self-identifies
+    # rather than collapsing onto "main". Reads keep `_get_agent_id() or
+    # agent_id` (visibility scoping is unaffected).
+    agent_id = effective_write_agent_id(_get_agent_id(), agent_id)
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+    # C3/C8 — reject reserved memory_types at the boundary before we
+    # touch the DB. Single-write checks the top-level kwarg; the batch
+    # path below loops over BulkMemoryItem after validation.
+    if content is not None and (refuse := _refuse_reserved_memory_type(memory_type)):
+        return _with_latency(refuse, t0)
+
+    # WRITES → home tenant only. ``enforce_fleet_write`` (agent_service →
+    # storage client), ``check_and_increment`` (db unused), ``create_memory`` /
+    # ``create_memories_bulk`` (memory_service pipeline → storage client) are all
+    # storage-routed and pin to the home tenant via the ``tenant_id`` carried in
+    # the ``MemoryCreate`` / ``BulkMemoryCreate`` payload — never a foreign
+    # tenant, and no readable-set widening on the write path. ``_no_db()`` yields
+    # ``None`` (no RLS session) while keeping the storage-routed services'
+    # ``db``-first signatures satisfied.
+    async with _no_db():
+        try:
+            # Register the calling agent (auto-create row on first write) and
+            # enforce trust gating for cross-fleet writes — same surface the
+            # REST write path uses. Without this, MCP writes succeed without
+            # ever creating an Agent row, so a follow-up
+            # PATCH /agents/{id}/trust 404s.
+            agent = await enforce_fleet_write(tenant_id, agent_id, fleet_id)
+            # Mirror the REST write paths (routes/memories.py:937, :1125): an
+            # omitted fleet_id resolves to the caller's home fleet, so an MCP
+            # write scopes like a REST write instead of persisting
+            # fleet_id=NULL — a NULL-fleet row silently drops out of
+            # teammates' scope_team / fleet-filtered recall. Fires only when
+            # fleet_id is falsy, so an explicit (incl. cross-fleet) fleet_id
+            # is left untouched and still passes through the trust gate
+            # enforce_fleet_write applied above. If the agent has no home
+            # fleet (never been scoped), this is a no-op and the row stays
+            # NULL — unchanged from prior behavior.
+            if not fleet_id and agent.get("fleet_id"):
+                fleet_id = agent["fleet_id"]
+            if content is not None:
+                await check_and_increment(tenant_id, "write")
+                result = await create_memory(
+                    MemoryCreate(
+                        tenant_id=tenant_id,
+                        fleet_id=fleet_id,
+                        agent_id=agent_id,
+                        memory_type=memory_type,
+                        content=content,
+                        weight=weight,
+                        source_uri=source_uri,
+                        run_id=run_id,
+                        metadata=metadata,
+                        status=status,
+                        visibility=visibility,
+                        write_mode=write_mode,
+                    ),
+                )
+                return _with_latency(_serialize(result), t0)
+            # Batch path
+            if len(items) > 100:
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "error": {
+                                "code": "BATCH_TOO_LARGE",
+                                "message": f"items length {len(items)} exceeds maximum of 100.",
+                                "details": {"received": len(items), "max": 100},
+                            }
+                        }
+                    ),
+                    t0,
+                )
+            try:
+                bulk_items = [BulkMemoryItem(**item) for item in items]
+            except (ValidationError, TypeError) as e:
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "error": {
+                                "code": "INVALID_BATCH_ITEM",
+                                "message": f"Invalid items — {e}",
+                                "details": {"received_count": len(items)},
+                            }
+                        }
+                    ),
+                    t0,
+                )
+            # C3/C8 — reject reserved memory_types per-item so the
+            # offending index is named in the error message.
+            for _idx, _item in enumerate(bulk_items):
+                if refuse := _refuse_reserved_memory_type(_item.memory_type, index=_idx):
+                    return _with_latency(refuse, t0)
+            bulk_data = BulkMemoryCreate(
+                tenant_id=tenant_id,
+                fleet_id=fleet_id,
+                agent_id=agent_id,
+                items=bulk_items,
+                visibility=visibility,
+            )
+            # MCP transport doesn't surface ``X-Bulk-Attempt-Id``;
+            # mint a server-side attempt id so each MCP-driven bulk
+            # call still gets per-item idempotency. A retried MCP tool
+            # call will use a different attempt id (so it isn't
+            # idempotent across MCP retries) — the MCP transport is
+            # unary and the loadtest finding (CAURA-602) doesn't apply
+            # to it; the trade-off is acceptable to keep this path
+            # simple. If a use case needs MCP retry idempotency, the
+            # client can pass an explicit token via metadata.
+            result = await create_memories_bulk(bulk_data, bulk_attempt_id=f"mcp:{uuid4()}")
+            return _with_latency(_serialize(result), t0)
+        except HTTPException as e:
+            # Idempotent retry-safe duplicate: when create_memory raises 409
+            # with the "Duplicate memory exists: <uuid>" detail (Stage 5's
+            # per-agent exact-hash dedup hit), surface a 200-shaped success
+            # envelope so callers can treat the retry as a no-op rather than
+            # an error. Semantic-duplicate hits still surface as errors —
+            # the caller wrote new content that we suppressed, which is a
+            # semantically distinct outcome.
+            if e.status_code == 409 and (existing_id := _extract_duplicate_id(str(e.detail))):
+                payload = {
+                    "status": "duplicate",
+                    "existing_id": existing_id,
+                    "agent_id": agent_id,
+                }
+                logger.info(
+                    "memclaw_write: idempotent duplicate hit existing=%s agent=%s",
+                    existing_id,
+                    agent_id,
+                )
+                return _with_latency(json.dumps(payload), t0)
+            logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+
+
+async def memclaw_manage(
+    op: Annotated[str, Field(description="read|update|transition|delete|bulk_delete|lineage.")],
+    memory_id: Annotated[str, Field(description="UUID. Required except for op=bulk_delete.")] = "",
+    memory_ids: Annotated[
+        list[str] | None,
+        Field(description="op=bulk_delete: list of memory UUIDs (max 1000)."),
+    ] = None,
+    status: Annotated[str | None, Field(description="op=transition.")] = None,
+    content: Annotated[str | None, Field(description="op=update.")] = None,
+    memory_type: Annotated[str | None, Field(description="op=update.")] = None,
+    weight: Annotated[float | None, Field(description="op=update; 0-1.")] = None,
+    title: Annotated[str | None, Field(description="op=update.")] = None,
+    metadata: Annotated[dict | None, Field(description="op=update.")] = None,
+    source_uri: Annotated[str | None, Field(description="op=update.")] = None,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+) -> str:
+    """Per-memory lifecycle: read | update | transition | delete | bulk_delete | lineage.
+
+    op=lineage walks the supersession chain for `memory_id` and returns
+    {this, superseded_by, supersessors} — the older row this memory
+    replaced (if any) and any newer rows that supersede this one.
+    Mirrors the focused agent-facing view of REST `/memories/{id}/contradictions`.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    _valid_ops = {"read", "update", "transition", "delete", "bulk_delete", "lineage"}
+    if op not in _valid_ops:
+        return _with_latency(
+            json.dumps(
+                {
+                    "error": {
+                        "code": "INVALID_ARGUMENTS",
+                        "message": f"Unknown op '{op}'. Expected one of: {sorted(_valid_ops)}.",
+                        "details": {"op": op, "expected_ops": sorted(_valid_ops)},
+                    }
+                }
+            ),
+            t0,
+        )
+    # Mutating ops gated by the credential scope set; read/lineage stay open
+    # to read-only keys.
+    if op in {"update", "transition", "delete", "bulk_delete"} and (err := _check_write_scope()):
+        return err
+    # bulk_delete uses memory_ids (list); all other ops use memory_id (single UUID).
+    # Validate accordingly so a missing memory_id on bulk_delete doesn't fail with
+    # a misleading "Invalid UUID" error.
+    if op != "bulk_delete":
+        try:
+            uid = UUID(memory_id)
+        except ValueError:
+            return _with_latency(
+                _error_response("INVALID_ARGUMENTS", "Invalid memory_id — must be a valid UUID."),
+                t0,
+            )
+    tenant_id = _get_tenant()
+    # Raw authenticated identity (gateway-resolved). Used for fleet/scope
+    # authorization — must NOT fall back to the ``mcp-agent`` default, or an
+    # unauthenticated caller would inherit that identity's scope. ``None`` ⇒
+    # no agent context (OSS/standalone) ⇒ tenant-scoped, no agent isolation.
+    caller_agent_id = _get_agent_id()
+    agent_id = caller_agent_id or agent_id
+    if op in {"update", "transition", "delete", "bulk_delete"} and (
+        refuse := _refuse_default_agent_on_gateway(agent_id)
+    ):
+        return _with_latency(refuse, t0)
+
+    # All ops are storage-routed (``_no_db()`` ⇒ db=None): reads/writes carry
+    # tenant context explicitly. WRITES (bulk_delete / transition / update /
+    # delete) target the HOME tenant only — the storage methods scope by the
+    # explicit ``tenant_id``; READS (read / lineage) also pin to the home
+    # tenant here (per-id manage never widens to the readable set — same as
+    # pre-migration, which scoped every ``get_by_id_for_tenant`` to ``tenant_id``
+    # and never consulted ``readable_tenant_ids``).
+    sc = get_storage_client()
+    async with _no_db():
+        try:
+            if op == "bulk_delete":
+                if not memory_ids:
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS", "op=bulk_delete requires non-empty 'memory_ids'."
+                        ),
+                        t0,
+                    )
+                if len(memory_ids) > 1000:
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS", f"op=bulk_delete capped at 1000 ids (got {len(memory_ids)})."
+                        ),
+                        t0,
+                    )
+                try:
+                    uids = [UUID(i) for i in memory_ids]
+                except ValueError as e:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", f"invalid UUID in memory_ids — {e}"), t0
+                    )
+                # Trust gate (>= 3), mirroring single delete / REST DELETE. Blocks
+                # the cross-fleet bulk-delete-by-id IDOR for sub-admin agents; a
+                # trust>=3 admin agent retains tenant-wide delete (parity with
+                # enforce_fleet_write). No-op for tenant-scoped credentials.
+                if caller_agent_id:
+                    await enforce_delete(tenant_id, caller_agent_id)
+                # HOME-tenant scoped soft-delete: the storage method applies the
+                # exact pre-migration predicate (tenant_id + id IN (...) +
+                # deleted_at IS NULL → set deleted_at=now, status='deleted') and
+                # returns the affected count. No cross-tenant widening.
+                deleted_count = await sc.soft_delete_by_ids(tenant_id, [str(u) for u in uids])
+                await log_action(
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    action="bulk_delete",
+                    resource_type="memory",
+                    detail={"count": deleted_count, "method": "by_ids", "via": "mcp"},
+                )
+                return _with_latency(json.dumps({"deleted": deleted_count, "requested": len(uids)}), t0)
+            if op == "lineage":
+                # HOME-tenant scoped. ``get_memory_contradictions`` bundles the
+                # three reads (this row + supersessors + older) in one storage
+                # round-trip. Storage enforces tenant match + ``deleted_at IS
+                # NULL`` on the target and the supersessors, plus the
+                # cross-tenant ``older`` guard. It returns None on the target
+                # being absent/soft-deleted/wrong-tenant — same NOT_FOUND as
+                # before. NOTE: storage returns ``older`` regardless of its
+                # ``deleted_at`` (so the consumer can decide per-field, mirroring
+                # REST ``/memories/{id}/contradictions``); the pre-migration
+                # inline query excluded a soft-deleted ``older`` from
+                # ``superseded_by``, so we re-apply that filter client-side below.
+                bundle = await sc.get_memory_contradictions(tenant_id, str(uid))
+                if not bundle:
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
+                this = bundle["memory"]
+                # Fleet/agent-scope authorization (mirrors op=read): the
+                # supersession chain would otherwise leak a scoped row by id.
+                if not await authorize_memory_access(
+                    tenant_id,
+                    caller_agent_id,
+                    visibility=this.get("visibility"),
+                    owner_agent_id=this.get("agent_id"),
+                    fleet_id=this.get("fleet_id"),
+                ):
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
+
+                def _chain_row(row: dict) -> dict:
+                    content = row.get("content") or ""
+                    return {
+                        "id": str(row.get("id")),
+                        "content_preview": content[:200],
+                        "status": row.get("status"),
+                        "created_at": row.get("created_at"),
+                    }
+
+                # The older memory this row replaced (if any). Storage applied
+                # the same-tenant guard; re-apply the soft-deleted filter here so
+                # a soft-deleted ``older`` is excluded exactly as the
+                # pre-migration inline query did (``older.deleted_at is None``).
+                older = bundle.get("older")
+                superseded_by = _chain_row(older) if older and older.get("deleted_at") is None else None
+                # Newer rows whose supersedes_id points at this row.
+                supersessors = [_chain_row(m) for m in bundle.get("supersessors", [])]
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "this": {
+                                "id": str(this.get("id")),
+                                "status": this.get("status"),
+                                "supersedes_id": (
+                                    str(this["supersedes_id"]) if this.get("supersedes_id") else None
+                                ),
+                            },
+                            "superseded_by": superseded_by,  # the OLDER row this replaced
+                            "supersessors": supersessors,  # NEWER rows that replaced this
+                        },
+                        default=str,
+                    ),
+                    t0,
+                )
+            if op == "read":
+                memory = await sc.get_memory_for_tenant(tenant_id, str(uid))
+                if not memory:
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
+                # Fleet/agent-scope authorization: honor the same scope_agent +
+                # cross-fleet trust ladder the search/list paths enforce, so an
+                # agent can't read a peer's scoped row by id. NOT_FOUND (not
+                # PERMISSION_DENIED) to avoid confirming the id exists.
+                if not await authorize_memory_access(
+                    tenant_id,
+                    caller_agent_id,
+                    visibility=memory.get("visibility"),
+                    owner_agent_id=memory.get("agent_id"),
+                    fleet_id=memory.get("fleet_id"),
+                ):
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "id": str(memory.get("id")),
+                            "content": memory.get("content"),
+                            "memory_type": memory.get("memory_type"),
+                            "status": memory.get("status"),
+                            "weight": memory.get("weight"),
+                            "agent_id": memory.get("agent_id"),
+                            "fleet_id": memory.get("fleet_id"),
+                            "visibility": memory.get("visibility"),
+                            "title": memory.get("title"),
+                            "created_at": memory.get("created_at"),
+                            "last_recalled_at": memory.get("last_recalled_at"),
+                            "recall_count": memory.get("recall_count", 0),
+                            "deleted_at": memory.get("deleted_at"),
+                            "metadata": memory.get("metadata_"),
+                        },
+                        default=str,
+                    ),
+                    t0,
+                )
+            if op == "transition":
+                if not status:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=transition requires 'status'."), t0
+                    )
+                if status not in MEMORY_STATUSES:
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS",
+                            f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+                        ),
+                        t0,
+                    )
+                # WRITE → home tenant only.
+                memory = await sc.get_memory_for_tenant(tenant_id, str(uid))
+                if not memory:
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
+                # Cross-fleet / scope_agent authorization (write threshold).
+                if not await authorize_memory_access(
+                    tenant_id,
+                    caller_agent_id,
+                    visibility=memory.get("visibility"),
+                    owner_agent_id=memory.get("agent_id"),
+                    fleet_id=memory.get("fleet_id"),
+                    write=True,
+                ):
+                    return _with_latency(
+                        _error_response(
+                            "PERMISSION_DENIED",
+                            f"Agent cannot modify memory in fleet '{memory.get('fleet_id')}'.",
+                        ),
+                        t0,
+                    )
+                old_status = memory.get("status")
+                await sc.update_memory_status(str(uid), status, tenant_id=tenant_id)
+                await log_action(
+                    tenant_id=tenant_id,
+                    agent_id=memory.get("agent_id"),
+                    action="status_update",
+                    resource_type="memory",
+                    resource_id=uid,
+                    detail={"old_status": old_status, "new_status": status},
+                )
+                return _with_latency(f"Memory {memory_id} status updated: {old_status} -> {status}", t0)
+            if op == "update":
+                fields: dict = {}
+                if content is not None:
+                    fields["content"] = content
+                if memory_type is not None:
+                    fields["memory_type"] = memory_type
+                if weight is not None:
+                    fields["weight"] = weight
+                if title is not None:
+                    fields["title"] = title
+                if status is not None:
+                    fields["status"] = status
+                if metadata is not None:
+                    fields["metadata"] = metadata
+                if source_uri is not None:
+                    fields["source_uri"] = source_uri
+                if not fields:
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS",
+                            "No fields to update. Provide at least one field to change.",
+                        ),
+                        t0,
+                    )
+                # WRITE → home tenant only. ``update_memory`` is storage-routed
+                # and scopes the row to the explicit ``tenant_id``.
+                await check_and_increment(tenant_id, "write")
+                result = await update_memory(uid, tenant_id, MemoryUpdate(**fields), agent_id=agent_id)
+                return _with_latency(_serialize(result), t0)
+            # op == "delete" — WRITE → home tenant only.
+            if caller_agent_id:
+                # Trust gate (>= 3) + cross-fleet / scope_agent row authorization,
+                # mirroring REST DELETE /memories/{id}.
+                await enforce_delete(tenant_id, caller_agent_id)
+                target = await sc.get_memory_for_tenant(tenant_id, str(uid))
+                if target and not await authorize_memory_access(
+                    tenant_id,
+                    caller_agent_id,
+                    visibility=target.get("visibility"),
+                    owner_agent_id=target.get("agent_id"),
+                    fleet_id=target.get("fleet_id"),
+                    write=True,
+                ):
+                    return _with_latency(
+                        _error_response(
+                            "PERMISSION_DENIED",
+                            f"Agent cannot delete memory in fleet '{target.get('fleet_id')}'.",
+                        ),
+                        t0,
+                    )
+            await soft_delete_memory(uid, tenant_id)
+            return _with_latency(f"Memory {memory_id} deleted.", t0)
+        except HTTPException as e:
+            logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+        except httpx.HTTPStatusError as e:
+            # storage_client raises on non-2xx — surface the upstream status +
+            # detail in the canonical envelope (parity with sibling tools).
+            return _storage_error_envelope(e, t0)
+
+
+async def memclaw_entity_get(
+    entity_id: Annotated[str, Field(description="The UUID of the entity to look up.")],
+) -> str:
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    try:
+        uid = UUID(entity_id)
+    except ValueError:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "Invalid entity_id — must be a valid UUID."),
+            t0,
+        )
+
+    # ``get_entity`` is storage-routed (entity_service → storage client); the
+    # ``db`` arg is used only by a best-effort on_recall hook that swallows its
+    # own errors, so pass ``None`` rather than open an RLS session. Tenant
+    # isolation is carried by the explicit ``tenant_id`` + ``caller_agent_id``
+    # the service already forwards to the storage client.
+    try:
+        result = await get_entity(uid, _get_tenant(), caller_agent_id=_get_agent_id())
+    except HTTPException as e:
+        return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+    except httpx.HTTPStatusError as e:
+        return _storage_error_envelope(e, t0)
+    except Exception as e:
+        logger.exception("Unhandled error in memclaw_entity_get")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+    text = "Entity not found." if not result else _serialize(result)
+    return _with_latency(text, t0)
+
+
+async def memclaw_tune(
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    top_k: Annotated[int | None, Field(description="1-20.")] = None,
+    min_similarity: Annotated[float | None, Field(description="0.1-0.9.")] = None,
+    fts_weight: Annotated[float | None, Field(description="0=semantic, 1=keyword.")] = None,
+    freshness_floor: Annotated[float | None, Field(description="0-1.")] = None,
+    freshness_decay_days: Annotated[int | None, Field(description="7-730.")] = None,
+    recall_boost_cap: Annotated[float | None, Field(description="1-3.")] = None,
+    recall_decay_window_days: Annotated[int | None, Field(description="7-365.")] = None,
+    graph_max_hops: Annotated[int | None, Field(description="0-3.")] = None,
+    similarity_blend: Annotated[float | None, Field(description="0-1.")] = None,
+) -> str:
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if err := _check_write_scope():
+        return err
+    tenant_id = _get_tenant()
+    agent_id = _get_agent_id() or agent_id
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+
+    try:
+        profile = SearchProfileUpdate(
+            top_k=top_k,
+            min_similarity=min_similarity,
+            fts_weight=fts_weight,
+            freshness_floor=freshness_floor,
+            freshness_decay_days=freshness_decay_days,
+            recall_boost_cap=recall_boost_cap,
+            recall_decay_window_days=recall_decay_window_days,
+            graph_max_hops=graph_max_hops,
+            similarity_blend=similarity_blend,
+        )
+    except (ValidationError, ValueError) as e:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", f"{e}"), t0)
+
+    updates = profile.model_dump(exclude_none=True)
+    # WRITE → home tenant only. ``get_or_create_agent`` is storage-routed and
+    # scopes the lookup/create to ``tenant_id``; the search-profile PATCH then
+    # targets that agent's PK (``agent["id"]``). No cross-tenant widening — a
+    # tune never touches a foreign tenant's agent row.
+    try:
+        agent = await get_or_create_agent(tenant_id, agent_id)
+        current = agent.get("search_profile") or {}
+        if updates:
+            current.update(updates)
+            current = validate_search_profile(current)
+            await get_storage_client().update_search_profile(agent["id"], {"search_profile": current})
+        return _with_latency(json.dumps({"agent_id": agent_id, "search_profile": current}, indent=2), t0)
+    except HTTPException as e:
+        logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+        return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+    except httpx.HTTPStatusError as e:
+        return _storage_error_envelope(e, t0)
+
+
+# ---------------------------------------------------------------------------
+# Consolidated tools: doc CRUD, list, knowledge-layer placeholders
+# ---------------------------------------------------------------------------
+
+
+# The ``skills`` collection backs the agent-to-agent skill catalog (formerly
+# served by the dropped memclaw_share_skill / memclaw_unshare_skill tools).
+# Slugs become directory names on plugin-side reconciliation
+# (``plugin/skills/<slug>/SKILL.md``), so doc_id is constrained to a
+# filesystem-safe identifier — same regex the old skill_service used so
+# pre-migration uploads remain valid.
+SKILLS_COLLECTION = "skills"
+_SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+
+# The agent-facing MCP surface only exposes skills in this status. The
+# Skill Factory lifecycle (candidate → staged → active) gates what an
+# agent can discover: candidate/staged/quarantined/rejected skills are
+# in-flight or blocked and must NOT surface to agents. Only this filter
+# turns "an operator approved it" into "agents can find it".
+_AGENT_VISIBLE_SKILL_STATUS = "active"
+
+
+async def _skills_factory_flag(tenant_id: str) -> bool:
+    """Strict opt-in check — RAISES on a settings-lookup failure.
+
+    Is ``skills_factory.enabled`` true for this tenant? Callers that gate
+    a SECURITY decision (op=write / op=delete) wrap this and **fail
+    closed** (abort the mutation) on error — they must never proceed
+    unvalidated just because the flag couldn't be read. Read-path callers
+    use the lenient ``_skills_factory_enabled`` wrapper instead.
+    ``get_raw_settings`` is cache-first (5-min TTL), so this is a cheap
+    hot-path check.
+    """
+    raw = await get_raw_settings(tenant_id)
+    return (
+        isinstance(raw, dict)
+        and isinstance(raw.get("skills_factory"), dict)
+        and bool(raw["skills_factory"].get("enabled"))
+    )
+
+
+async def _skills_factory_enabled(tenant_id: str) -> bool:
+    """Non-raising opt-in check for the active-only skill-read filter
+    (read / query / search) — fails CLOSED on a settings-lookup failure.
+
+    On success returns the tenant's true ``skills_factory.enabled`` flag,
+    so non-opted-in tenants keep byte-identical (unfiltered) read
+    behavior — the merge-day no-op invariant.
+
+    On a settings-lookup FAILURE it returns ``True`` (assume enabled), so
+    the active-only filter IS applied: a transient settings outage must
+    not let a non-active skill (candidate / staged / quarantined) leak to
+    an agent. The read still succeeds — it's filtered, not 500'd — so the
+    cost is only that, during an outage, a tenant temporarily sees just
+    their ``active`` skills. For non-opted-in tenants that is a near
+    no-op (their skills are all ``active`` post-migration). This keeps
+    ALL skill gates fail-closed: write/delete abort, reads filter.
+    """
+    try:
+        return await _skills_factory_flag(tenant_id)
+    except Exception:
+        logger.warning(
+            "skills_factory flag lookup failed for %s; failing CLOSED — active-only "
+            "filter APPLIED (only status='active' skills surface) until cache recovers",
+            tenant_id,
+        )
+        return True
+
+
+def _safe_int(val: Any, default: int) -> int:
+    """Coerce a settings value to int, falling back to ``default`` on a
+    null, boolean, or non-numeric value. The per-tenant byte caps are
+    operator-editable JSON, so a misconfiguration (``null``, ``"auto"``,
+    ``true``/``false``) must degrade to the documented default — not
+    crash (or silently mis-cap) the skills write path.
+
+    ``bool`` is checked first because it is a subclass of ``int`` in
+    Python: ``int(True) == 1`` / ``int(False) == 0`` would otherwise pass
+    through silently and produce a 1- or 0-byte cap rather than the
+    intended default."""
+    if isinstance(val, bool):
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _doc_field(doc: Any, name: str, default: Any = None) -> Any:
+    """Read a document field from either a storage-client dict or an ORM row.
+
+    Fix 2 Phase 4 routes ``memclaw_doc`` through the storage HTTP client, so the
+    documents come back as plain dicts; pre-migration tests (and any residual
+    ORM caller) pass an attribute-bearing object. Normalise both so the
+    skill-gate / response-shaping code stays shape-agnostic."""
+    if isinstance(doc, dict):
+        return doc.get(name, default)
+    return getattr(doc, name, default)
+
+
+def _skill_hidden_from_agent(doc: Any, *, caller_tenant_id: str, caller_opted_in: bool) -> bool:
+    """Whether a fetched row must NOT surface on the agent MCP skill
+    surface.
+
+    A skills-collection row is hidden when it is non-active AND either:
+
+      • the caller's tenant opted in (the active-only gate applies to
+        the caller's own skills), or
+      • the row belongs to a DIFFERENT tenant than the caller — a
+        sibling tenant's in-flight / blocked skill must never leak
+        through cross-tenant credentials, regardless of the *caller's*
+        own opt-in flag. This is safe: a non-opted-in owning tenant's
+        skills are all ``active`` (backfilled by migration 022), so this
+        only ever hides a genuinely non-active row, never a legitimately
+        visible one.
+
+    Non-skills rows are never hidden. Keyed off the row's own
+    ``tenant_id`` so the decision follows the OWNING tenant, not just
+    the caller's flag (closes the cross-tenant read leak).
+
+    Accepts either an ORM Document or a storage-client dict (Fix 2 Phase 4
+    routes ``memclaw_doc`` through the storage HTTP client, which returns
+    dicts) — ``_doc_field`` normalises field access across both shapes."""
+    if _doc_field(doc, "collection") != SKILLS_COLLECTION:
+        return False
+    if (_doc_field(doc, "data") or {}).get("status") == _AGENT_VISIBLE_SKILL_STATUS:
+        return False
+    return caller_opted_in or _doc_field(doc, "tenant_id", caller_tenant_id) != caller_tenant_id
+
+
+async def memclaw_doc(
+    op: Annotated[str, Field(description="write|read|query|delete|list_collections|search.")],
+    collection: Annotated[
+        str | None,
+        Field(
+            description="Collection. Required for write|read|query|delete|search; omitted for list_collections."
+        ),
+    ] = None,
+    doc_id: Annotated[str | None, Field(description="op=write|read|delete.")] = None,
+    data: Annotated[dict | None, Field(description="op=write.")] = None,
+    where: Annotated[dict | None, Field(description="op=query.")] = None,
+    order_by: Annotated[str | None, Field(description="op=query.")] = None,
+    order: Annotated[str, Field(description="op=query: asc|desc.")] = "asc",
+    limit: Annotated[int, Field(description="op=query.")] = 20,
+    offset: Annotated[int, Field(description="op=query.")] = 0,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    fleet_id: Annotated[
+        str | None,
+        Field(description="op=write; optional scoping filter for op=list_collections|search."),
+    ] = None,
+    query: Annotated[str | None, Field(description="op=search: natural-language query.")] = None,
+    top_k: Annotated[int, Field(description="op=search: max results (1-50).")] = 5,
+) -> str:
+    """Structured-document CRUD. Op-dispatched. Replaces the 4 prior
+    `memclaw_doc_*` tools."""
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    _valid_ops = {"write", "read", "query", "delete", "list_collections", "search"}
+    if op not in _valid_ops:
+        return _with_latency(
+            json.dumps(
+                {
+                    "error": {
+                        "code": "INVALID_ARGUMENTS",
+                        "message": f"Unknown op '{op}'. Expected one of: {sorted(_valid_ops)}.",
+                        "details": {"op": op, "expected_ops": sorted(_valid_ops)},
+                    }
+                }
+            ),
+            t0,
+        )
+    # `collection` is required for write/read/query/delete. It is optional
+    # for list_collections (by design) and for search (where omitting it
+    # means "search across every collection in this tenant" — the broad
+    # strategy; supply collection to scope the search to just one).
+    if op not in {"list_collections", "search"} and not collection:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", f"op={op} requires 'collection'."), t0)
+    # Write/delete are gated by the credential scope set; read/query/list/search
+    # remain available to read-only keys.
+    if op in {"write", "delete"} and (err := _check_write_scope()):
+        return err
+    tenant_id = _get_tenant()
+    # Raw authenticated identity for the delete trust gate (None ⇒ no agent
+    # context). Must not fall back to the ``mcp-agent`` default.
+    caller_agent_id = _get_agent_id()
+    agent_id = caller_agent_id or agent_id
+    # A29 — refuse the default identity on every op. Was previously
+    # write-only (A14); reads inherit the same contract because the
+    # silent-empty-result UX is its own class of paper cut, and ``delete``
+    # is a destructive op that was inadvertently un-guarded under the
+    # earlier write-only scope.
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+
+    # Cross-tenant credentials widen READ ops (list_collections, read, query,
+    # search) via ``readable_tenant_ids``. WRITE/DELETE pin to the HOME tenant —
+    # same contract as recall vs write. ``readable`` stays None for
+    # single-tenant callers; storage falls back to ``tenant_id = $1``. All doc
+    # access is now storage-routed (``_no_db()`` ⇒ db=None); the org-settings /
+    # skills-gate helpers below are storage-backed and ignore the ``None`` db.
+    sc = get_storage_client()
+    readable = _get_readable_tenants() or None
+    READ_OPS = {"list_collections", "read", "query", "search"}
+
+    async with _no_db():
+        try:
+            if op == "list_collections":
+                collections_resp = await sc.list_document_collections(
+                    tenant_id=tenant_id,
+                    fleet_id=fleet_id,
+                    readable_tenant_ids=readable if op in READ_OPS else None,
+                )
+                rows = [(c["name"], c["count"]) for c in collections_resp.get("collections", [])]
+                # Active-only count correction for skills: an opted-in
+                # tenant's listing must not advertise non-active skills
+                # in the count — they're invisible to read/query/search,
+                # so a count that includes them is misleading. Recompute
+                # the skills row restricted to status='active', over the
+                # same (possibly cross-tenant) scope the listing used.
+                # One COUNT, only when a skills row is present AND the
+                # tenant opted in.
+                if any(name == SKILLS_COLLECTION for name, _ in rows) and await _skills_factory_enabled(
+                    tenant_id
+                ):
+                    active_count = await sc.document_count_in_collection(
+                        tenant_id,
+                        SKILLS_COLLECTION,
+                        status=_AGENT_VISIBLE_SKILL_STATUS,
+                        fleet_id=fleet_id,
+                        readable_tenant_ids=readable,
+                    )
+                    rows = [
+                        (name, active_count if name == SKILLS_COLLECTION else count) for name, count in rows
+                    ]
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "collections": [{"name": name, "count": count} for name, count in rows],
+                            "count": len(rows),
+                        }
+                    ),
+                    t0,
+                )
+            if op == "write":
+                if not doc_id:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=write requires 'doc_id'."), t0
+                    )
+                if data is None:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=write requires 'data'."), t0
+                    )
+                # Skills slug rule — doc_id becomes a filesystem directory
+                # on the plugin side, so it must be filesystem-safe.
+                if collection == SKILLS_COLLECTION and not _SKILL_SLUG_RE.fullmatch(doc_id):
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS",
+                            f"collection='skills' requires doc_id matching "
+                            f"{_SKILL_SLUG_RE.pattern} — got {doc_id!r}. "
+                            "Slugs become directory names on each plugin node.",
+                        ),
+                        t0,
+                    )
+                # ── Skill Factory SF-002 lifecycle validator ─────────
+                # The agent-facing MCP write path runs the SAME validator
+                # the REST route does (routes/documents.py §SF-002), so an
+                # agent-direct skill write flows through the planned
+                # lifecycle instead of landing unvalidated in limbo:
+                #   • status defaults to 'staged' → HITL Inbox (a skill is
+                #     never agent-visible until approved to 'active')
+                #   • status RBAC 403s a caller-supplied 'active' /
+                #     'candidate' / system status — this is what actually
+                #     closes self-promotion (not a blanket status reject)
+                #   • source RBAC 403s source='forge'/'manual' from an
+                #     agent caller (they must use source='agent')
+                #   • Sentinel pre-scan + content_hash + byte/slug caps
+                # MCP callers carry NO admin/forge identity — there is no
+                # is_admin/org_role accessor on this surface — so both
+                # is_admin and is_internal_forge are False. An admin who
+                # needs to author an 'active' skill uses the REST/dashboard
+                # path, which has the real auth context. Gated on the
+                # opt-in flag: non-opted-in tenants skip the validator
+                # entirely (byte-identical legacy behavior). The validator
+                # raises HTTPException (403/422/409/404); the outer
+                # ``except HTTPException`` maps it to the right error code.
+                if collection == SKILLS_COLLECTION:
+                    # ONE settings read for both the opt-in flag and the
+                    # per-tenant byte caps. ``get_settings_for_display``
+                    # returns the merged settings (which already include
+                    # ``skills_factory.enabled``), so the write path reads
+                    # the flag from it directly rather than calling
+                    # ``_skills_factory_enabled`` (a second DB-backed
+                    # ``get_raw_settings``) — one fewer cold-cache lookup.
+                    # read/query/search/delete keep the cheap helper since
+                    # they don't need the caps.
+                    # Fail CLOSED: this settings read gates a security
+                    # decision (whether the lifecycle validator runs). If
+                    # it fails we must NOT fall through and upsert the
+                    # skill unvalidated — abort the write instead.
+                    try:
+                        settings_display = await get_settings_for_display(tenant_id)
+                    except Exception:
+                        logger.exception(
+                            "skills_factory settings lookup failed for %s; cannot gate write",
+                            tenant_id,
+                        )
+                        return _with_latency(
+                            _error_response("INTERNAL_ERROR", "skill lifecycle gate unavailable"),
+                            t0,
+                        )
+                    sf_settings = (
+                        (settings_display.get("skills_factory") or {})
+                        if isinstance(settings_display, dict)
+                        else {}
+                    )
+                    if isinstance(sf_settings, dict) and bool(sf_settings.get("enabled")):
+                        # Defense-in-depth: reject a case-variant 'status'
+                        # key (e.g. 'STATUS', 'Status'). The validator
+                        # owns the canonical lowercase 'status' and
+                        # defaults it to 'staged', and every downstream
+                        # gate reads data->>'status' (case-sensitive in
+                        # JSONB), so a variant key cannot self-promote —
+                        # but it WOULD persist as a confusing shadow
+                        # field. Reject it rather than silently store it.
+                        if isinstance(data, dict):
+                            variant = next(
+                                (k for k in data if k != "status" and k.lower() == "status"),
+                                None,
+                            )
+                            if variant is not None:
+                                return _with_latency(
+                                    _error_response(
+                                        "INVALID_ARGUMENTS",
+                                        f"skills write: ambiguous status key {variant!r}. "
+                                        "Use lowercase 'status' only — and note status is "
+                                        "managed by the lifecycle (an agent write defaults "
+                                        "to 'staged'; transitions go through the Inbox).",
+                                    ),
+                                    t0,
+                                )
+                        from core_api.services.skill_lifecycle import (
+                            SkillWriteContext,
+                            validate_and_normalize_skill_write,
+                        )
+
+                        sf_ctx = SkillWriteContext(
+                            caller_agent_id=agent_id,
+                            is_admin=False,
+                            is_internal_forge=False,
+                            description_max_bytes=_safe_int(sf_settings.get("description_max_bytes"), 160),
+                            body_max_bytes=_safe_int(sf_settings.get("body_max_bytes"), 40_000),
+                        )
+                        # For kind='update' the validator needs the live
+                        # skill to bind against its current content_hash.
+                        # Mirror the REST path's read-through storage
+                        # fetch; the validator handles the not-found case.
+                        # ``isinstance`` guards a non-dict data (the
+                        # validator 422s it cleanly rather than us
+                        # AttributeError-ing into a 500 here).
+                        live_doc: dict | None = None
+                        if isinstance(data, dict) and data.get("kind") == "update":
+                            # Fail CLOSED, like the settings/flag gates: the
+                            # live-doc fetch feeds the validator's hash-
+                            # binding check, so a transient DB/network error
+                            # must abort with a curated message rather than
+                            # fall through to the outer handler (which would
+                            # leak the raw exception string).
+                            try:
+                                sc_live = get_storage_client()
+                                live_doc = await sc_live.get_document(
+                                    tenant_id=tenant_id,
+                                    collection=SKILLS_COLLECTION,
+                                    doc_id=doc_id,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "skills live-doc fetch failed for %s/%s; cannot gate update write",
+                                    tenant_id,
+                                    doc_id,
+                                )
+                                return _with_latency(
+                                    _error_response("INTERNAL_ERROR", "skill lifecycle gate unavailable"),
+                                    t0,
+                                )
+                        normalized, _scan = await validate_and_normalize_skill_write(
+                            data,
+                            ctx=sf_ctx,
+                            live_skill_doc=live_doc,
+                        )
+                        # Swap normalized data in for the rest of the flow
+                        # (embed + upsert). Status/source/scan/content_hash
+                        # and other server-controlled fields are merged.
+                        data = normalized
+                # Resolve which string in `data` gets embedded. The only
+                # embeddable field is data["summary"]; skills writes also
+                # accept data["description"] for back-compat. Non-skills
+                # writes without a summary store cleanly with no embedding
+                # (doc won't appear in op=search).
+                from core_api.services.doc_indexing import (
+                    InvalidDocIndexingError,
+                    resolve_embed_source,
+                )
+
+                try:
+                    source = resolve_embed_source(collection, data)
+                except InvalidDocIndexingError as exc:
+                    return _with_latency(_error_response("INVALID_ARGUMENTS", str(exc)), t0)
+                embedding: list[float] | None = None
+                if source is not None:
+                    from common.embedding import get_embedding
+
+                    embedding = await get_embedding(source)
+                    if embedding is None:
+                        return _with_latency(
+                            _error_response(
+                                "UPSTREAM_ERROR",
+                                "Embedding provider returned no vector "
+                                "(check provider config / quota). Write aborted.",
+                            ),
+                            t0,
+                        )
+                # Mirror memclaw_write's agent registration so a doc upsert
+                # via MCP creates the Agent row on first contact and enforces
+                # cross-fleet trust gating. WRITE → home tenant only.
+                write_agent = await enforce_fleet_write(tenant_id, agent_id, fleet_id)
+                # Same home-fleet resolution as memclaw_write: keep an omitted
+                # fleet_id from publishing a fleet_id=NULL doc/skill row that
+                # fleet-scoped teammates can't discover. No-op when the agent
+                # has no home fleet.
+                if not fleet_id and write_agent.get("fleet_id"):
+                    fleet_id = write_agent["fleet_id"]
+                await check_and_increment(tenant_id, "write")
+                row = await sc.upsert_document_xmax(
+                    {
+                        "tenant_id": tenant_id,
+                        "fleet_id": fleet_id,
+                        "collection": collection,
+                        "doc_id": doc_id,
+                        "data": data,
+                        "embedding": embedding,
+                    }
+                )
+                if row is None:
+                    return _with_latency(
+                        _error_response("INTERNAL_ERROR", "document upsert returned no rows"), t0
+                    )
+                # Storage returns ``{id, created_at, updated_at, xmax}``; ``xmax
+                # == 0`` ⇒ INSERT (new), else the on-conflict UPDATE fired.
+                is_new = int(row["xmax"]) == 0
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "collection": collection,
+                            "doc_id": doc_id,
+                            "action": "created" if is_new else "updated",
+                            "indexed": embedding is not None,
+                        }
+                    ),
+                    t0,
+                )
+            if op == "read":
+                if not doc_id:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=read requires 'doc_id'."), t0
+                    )
+                # READ — widens via ``readable_tenant_ids`` for cross-tenant
+                # credentials (home-only when single-tenant).
+                doc = await sc.get_document(
+                    tenant_id=tenant_id,
+                    collection=collection,
+                    doc_id=doc_id,
+                    readable_tenant_ids=readable,
+                )
+                if not doc:
+                    return _with_latency(f"Not found: {collection}/{doc_id}", t0)
+                # Active-only gate for agent-facing skill reads. A
+                # candidate / staged / quarantined / rejected skill is
+                # in-flight or blocked and must not surface to agents —
+                # return the same "Not found" as a missing doc so we
+                # don't leak the EXISTENCE of an unapproved skill. The
+                # decision follows the row's OWNING tenant: hidden when
+                # the caller's tenant opted in, OR when the row belongs
+                # to a different tenant (cross-tenant credentials must
+                # never surface a sibling tenant's in-flight skill).
+                # The collection check short-circuits the flag lookup for
+                # non-skills reads.
+                if _doc_field(doc, "collection") == SKILLS_COLLECTION:
+                    caller_opted_in = await _skills_factory_enabled(tenant_id)
+                    if _skill_hidden_from_agent(
+                        doc, caller_tenant_id=tenant_id, caller_opted_in=caller_opted_in
+                    ):
+                        return _with_latency(f"Not found: {collection}/{doc_id}", t0)
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "collection": _doc_field(doc, "collection"),
+                            "doc_id": _doc_field(doc, "doc_id"),
+                            "data": _doc_field(doc, "data"),
+                            "updated_at": _doc_field(doc, "updated_at"),
+                        },
+                        default=str,
+                    ),
+                    t0,
+                )
+            if op == "query":
+                effective_where = dict(where or {})
+                caller_opted_in = False
+                if collection == SKILLS_COLLECTION:
+                    caller_status = effective_where.get("status")
+                    if caller_status is not None and caller_status != _AGENT_VISIBLE_SKILL_STATUS:
+                        # Security-sensitive REJECTION path: refusing an
+                        # explicit non-active status only makes sense for
+                        # an opted-in tenant — for a tenant that never
+                        # opted in, the "use the Inbox API" message is
+                        # nonsense. So gate it on the STRICT flag and
+                        # fail CLOSED on a settings outage (INTERNAL_ERROR,
+                        # same as op=delete) rather than the lenient helper
+                        # (which assumes-enabled on error and would emit
+                        # the confusing pointer to a non-opted-in tenant).
+                        try:
+                            opted_in = await _skills_factory_flag(tenant_id)
+                        except Exception:
+                            logger.exception(
+                                "skills_factory flag lookup failed for %s; cannot gate query",
+                                tenant_id,
+                            )
+                            return _with_latency(
+                                _error_response("INTERNAL_ERROR", "skill lifecycle gate unavailable"),
+                                t0,
+                            )
+                        if opted_in:
+                            # An agent must not query for staged /
+                            # candidate skills. Reject (rather than
+                            # silently rewriting to 'active', which would
+                            # mislead the caller into thinking they
+                            # queried 'staged' and got nothing).
+                            return _with_latency(
+                                _error_response(
+                                    "INVALID_ARGUMENTS",
+                                    f"collection='skills' on the agent MCP surface only "
+                                    f"exposes status='active' docs; "
+                                    f"where={{'status': {caller_status!r}}} is not supported. "
+                                    "Inspect non-active skills via the Skills Inbox API "
+                                    "(/api/v1/skills-inbox/*).",
+                                ),
+                                t0,
+                            )
+                        # Genuinely not opted in: legacy behavior — the
+                        # caller's explicit status passes through untouched
+                        # (caller_opted_in stays False; the cross-tenant
+                        # net below still hides sibling non-active skills).
+                    else:
+                        # Common, SAFE path (no status, or status='active'
+                        # already): transparently scope to 'active'. Lenient
+                        # helper — fail-closed by FILTERING on a settings
+                        # outage (consistent with op=read), never errors a
+                        # plain query.
+                        caller_opted_in = await _skills_factory_enabled(tenant_id)
+                        if caller_opted_in:
+                            effective_where["status"] = _AGENT_VISIBLE_SKILL_STATUS
+                # READ — widens via ``readable_tenant_ids`` for cross-tenant.
+                docs = await sc.query_documents(
+                    {
+                        "tenant_id": tenant_id,
+                        "collection": collection,
+                        "where": effective_where,
+                        "order_by": order_by,
+                        "order": order,
+                        "limit": min(limit, 100),
+                        "offset": offset,
+                        "readable_tenant_ids": readable,
+                    }
+                )
+                # Cross-tenant safety net: when the caller's tenant is NOT
+                # opted in, the SQL status filter above never ran, so
+                # cross-tenant credentials could pull a sibling tenant's
+                # non-active skills. Drop them (the helper hides only
+                # rows owned by a different tenant in this branch; the
+                # caller's own rows are untouched — invariant preserved).
+                if collection == SKILLS_COLLECTION and not caller_opted_in:
+                    docs = [
+                        d
+                        for d in docs
+                        if not _skill_hidden_from_agent(d, caller_tenant_id=tenant_id, caller_opted_in=False)
+                    ]
+                items = [{"doc_id": _doc_field(d, "doc_id"), "data": _doc_field(d, "data")} for d in docs]
+                return _with_latency(
+                    json.dumps(
+                        {"collection": collection, "count": len(items), "results": items},
+                        default=str,
+                    ),
+                    t0,
+                )
+            if op == "search":
+                if not query or not query.strip():
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=search requires a non-empty 'query'."), t0
+                    )
+                from common.embedding import get_embedding
+
+                query_embedding = await get_embedding(query)
+                if query_embedding is None:
+                    return _with_latency(
+                        _error_response(
+                            "UPSTREAM_ERROR",
+                            "Embedding provider returned no vector "
+                            "(check provider config / quota). Search aborted.",
+                        ),
+                        t0,
+                    )
+                capped_top_k = max(1, min(top_k, 50))
+                # Active-only gate for a SCOPED skills search: push the
+                # status filter into the SQL so top_k stays exact (a
+                # post-filter alone would silently shrink the result
+                # set). For a broad search (collection=None) we can't
+                # filter in SQL without excluding non-skills collections.
+                search_status = None
+                scoped_skills_opted_in = collection == SKILLS_COLLECTION and await _skills_factory_enabled(
+                    tenant_id
+                )
+                if scoped_skills_opted_in:
+                    search_status = _AGENT_VISIBLE_SKILL_STATUS
+                # READ — widens via ``readable_tenant_ids``. Storage returns a
+                # list of doc dicts each carrying an inline ``similarity`` key
+                # (vs the repo's ``(Document, similarity)`` tuples).
+                search_data: dict[str, Any] = {
+                    "tenant_id": tenant_id,
+                    "collection": collection,  # None = span every collection (broad)
+                    "query_embedding": query_embedding,
+                    "top_k": capped_top_k,
+                    "fleet_id": fleet_id,
+                    "readable_tenant_ids": readable,
+                    "status": search_status,
+                }
+                pairs = await sc.search_documents_vector(search_data)
+                # Safety net for every skill row that the scoped SQL
+                # filter didn't already remove:
+                #   • broad search (collection=None) — skill rows the SQL
+                #     never touched, hidden when the caller opted in;
+                #   • cross-tenant rows (any search) — a sibling tenant's
+                #     non-active skill, hidden regardless of the caller's
+                #     own opt-in (the SQL status push only ran when the
+                #     CALLER opted in, so a non-opted-in caller reading
+                #     an opted-in sibling's skills would otherwise leak).
+                # ``_skill_hidden_from_agent`` encodes both rules per-row.
+                # The cheap ``any()`` scan short-circuits the cached flag
+                # lookup when no skill rows are present.
+                if any(_doc_field(d, "collection") == SKILLS_COLLECTION for d in pairs):
+                    # For a scoped skills search we already resolved the
+                    # flag; for a broad search resolve it now.
+                    caller_opted_in = (
+                        scoped_skills_opted_in
+                        if collection == SKILLS_COLLECTION
+                        else await _skills_factory_enabled(tenant_id)
+                    )
+                    pairs = [
+                        d
+                        for d in pairs
+                        if not _skill_hidden_from_agent(
+                            d, caller_tenant_id=tenant_id, caller_opted_in=caller_opted_in
+                        )
+                    ]
+                source_tenants = [t for t in (readable or []) if t and t != tenant_id]
+                if source_tenants:
+                    counts: dict[str, int] = {}
+                    for d in pairs:
+                        rt = _doc_field(d, "tenant_id")
+                        if rt:
+                            counts[rt] = counts.get(rt, 0) + 1
+                    await log_cross_tenant_read(
+                        home_tenant_id=tenant_id,
+                        home_agent_id=agent_id,
+                        source_tenants=source_tenants,
+                        surface="memclaw_doc_search",
+                        result_count_by_tenant=counts,
+                        query_summary=(query or "")[:200],
+                    )
+                # Always include `collection` per-row. When collection is
+                # omitted (broad search) the caller needs it to follow up
+                # with op=read. Zero cost when scoped; avoids a conditional
+                # response shape.
+                items = [
+                    {
+                        "collection": _doc_field(d, "collection"),
+                        "doc_id": _doc_field(d, "doc_id"),
+                        "data": _doc_field(d, "data"),
+                        "similarity": round(_doc_field(d, "similarity", 0.0), 4),
+                    }
+                    for d in pairs
+                ]
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "collection": collection,  # None if broad search
+                            "count": len(items),
+                            "results": items,
+                        },
+                        default=str,
+                    ),
+                    t0,
+                )
+            # op == "delete"
+            if not doc_id:
+                return _with_latency(_error_response("INVALID_ARGUMENTS", "op=delete requires 'doc_id'."), t0)
+            # Admin-trust (>= 3) gate for agent credentials, parity with memory
+            # deletes — a routine trust-1 agent must not destroy tenant documents.
+            if caller_agent_id:
+                await enforce_delete(tenant_id, caller_agent_id)
+            # Active-only existence gate for skills: an agent must not be
+            # able to delete (or probe the existence of) a non-active
+            # skill via MCP — those are operator-managed through the
+            # Inbox (reject/quarantine), not the agent surface. The status
+            # guard is folded directly into the storage DELETE's WHERE
+            # (``require_status``) so the check and the delete are a single
+            # atomic statement — no TOCTOU window where a concurrent admin
+            # promote/demote could change status between a separate pre-fetch
+            # and the delete. A non-active (or missing) skill deletes zero
+            # rows and falls through to the SAME generic not-found response a
+            # missing doc returns — so a non-active skill is byte-for-byte
+            # indistinguishable from a missing one (no existence leak), and
+            # the response stays valid JSON. WRITE → home tenant only (deletes
+            # never span readable tenants). Fail CLOSED: the status guard is a
+            # security gate, so use the strict (raising) flag check and abort
+            # on a settings-lookup failure rather than the lenient helper
+            # (which returns False → no status guard → fail-open delete).
+            # Short-circuits for non-skills collections (never touches
+            # settings).
+            try:
+                skills_gate_on = collection == SKILLS_COLLECTION and await _skills_factory_flag(tenant_id)
+            except Exception:
+                logger.exception("skills_factory flag lookup failed for %s; cannot gate delete", tenant_id)
+                return _with_latency(
+                    _error_response("INTERNAL_ERROR", "skill lifecycle gate unavailable"), t0
+                )
+            deleted = await sc.delete_document(
+                tenant_id,
+                collection,
+                doc_id,
+                require_status=_AGENT_VISIBLE_SKILL_STATUS if skills_gate_on else None,
+            )
+            if not deleted:
+                return _with_latency(
+                    json.dumps({"error": f"Document '{doc_id}' not found in collection '{collection}'"}),
+                    t0,
+                )
+            return _with_latency(
+                json.dumps({"ok": True, "collection": collection, "doc_id": doc_id, "deleted": True}),
+                t0,
+            )
+        except HTTPException as e:
+            logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+        except httpx.HTTPStatusError as e:
+            return _storage_error_envelope(e, t0)
+        except Exception as e:
+            logger.error("MCP doc op=%s error: %s", op, e, exc_info=True)
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+async def memclaw_list(
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    scope: Annotated[
+        str,
+        Field(
+            description="agent|fleet|all. 'agent' (default) = your memories only (trust ≥ 1). 'fleet'/'all' = cross-agent (trust ≥ 2)."
+        ),
+    ] = "agent",
+    fleet_id: Annotated[str | None, Field(description="Fleet.")] = None,
+    written_by: Annotated[str | None, Field(description="Author.")] = None,
+    memory_type: Annotated[str | None, Field(description="Type.")] = None,
+    status: Annotated[str | None, Field(description="Status.")] = None,
+    weight_min: Annotated[float | None, Field(description="Min weight 0-1.")] = None,
+    weight_max: Annotated[float | None, Field(description="Max weight 0-1.")] = None,
+    created_after: Annotated[str | None, Field(description="ISO8601.")] = None,
+    created_before: Annotated[str | None, Field(description="ISO8601.")] = None,
+    sort: Annotated[str, Field(description="created_at|weight|recall_count.")] = "created_at",
+    order: Annotated[str, Field(description="asc|desc.")] = "desc",
+    limit: Annotated[int, Field(description="1-50.")] = 25,
+    cursor: Annotated[str | None, Field(description="Pagination cursor.")] = None,
+    include_deleted: Annotated[bool, Field(description="Trust-3 only.")] = False,
+) -> str:
+    """Non-semantic memory enumeration: filter, sort, paginate by metadata.
+    scope='agent' (default) requires trust ≥ 1; scope='fleet'/'all' requires
+    trust ≥ 2. Trust 3 unlocks ``include_deleted``."""
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if scope not in VALID_SCOPES:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all."),
+            t0,
+        )
+    if memory_type and memory_type not in MEMORY_TYPES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}",
+            ),
+            t0,
+        )
+    if status and status not in MEMORY_STATUSES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+            ),
+            t0,
+        )
+    if sort not in {"created_at", "weight", "recall_count"}:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid sort '{sort}'. Must be one of: created_at, weight, recall_count.",
+            ),
+            t0,
+        )
+    if order not in {"asc", "desc"}:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "order must be 'asc' or 'desc'."),
+            t0,
+        )
+    if cursor and (sort != "created_at" or order != "desc"):
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                "cursor pagination requires sort=created_at and order=desc.",
+            ),
+            t0,
+        )
+    capped_limit = max(1, min(int(limit), 50))
+
+    tenant_id = _get_tenant()
+    agent_id = _get_agent_id() or agent_id
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+
+    if scope == "agent" and written_by is not None and written_by != agent_id:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"written_by must be omitted or match your own agent_id ('{agent_id}') when scope='agent'.",
+            ),
+            t0,
+        )
+
+    # Dynamic trust: scope='agent' requires trust ≥ 1, 'fleet'/'all' requires ≥ 2.
+    min_level = 1 if scope == "agent" else 2
+
+    # ``_require_trust`` is storage-routed (trust_service → storage client) and
+    # ``log_cross_tenant_read`` is fire-and-forget (audit queue → storage); the
+    # only db-bound call, ``memory_repo.list_by_filters``, becomes the storage
+    # client's ``list_memories_by_filters`` (same visibility predicate + cursor
+    # + readable widening, ported verbatim into PostgresService). ``_no_db()`` ⇒
+    # db=None. Tenant isolation: the READ widens via ``readable_tenant_ids`` ONLY
+    # for scope!='agent' (exactly as before); scope='agent' stays home-only and
+    # forces ``written_by`` to the caller. ``caller_agent_id`` carries the
+    # scope_agent visibility gate explicitly to storage.
+    async with _no_db():
+        try:
+            trust, _, terr = await _require_trust(tenant_id, agent_id, min_level=min_level)
+            if terr:
+                return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+
+            # scope='agent': force written_by to the caller's agent_id so they
+            # can only see their own memories regardless of other filters.
+            effective_written_by = agent_id if scope == "agent" else written_by
+
+            # include_deleted is silently ignored below trust 3
+            effective_include_deleted = include_deleted and trust >= 3
+
+            # Parse ISO date strings (validated early to avoid repo-level errors).
+            ts_after = ts_before = None
+            if created_after:
+                try:
+                    ts_after = _dt.fromisoformat(created_after)
+                except ValueError:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "created_after must be ISO8601."), t0
+                    )
+            if created_before:
+                try:
+                    ts_before = _dt.fromisoformat(created_before)
+                except ValueError:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "created_before must be ISO8601."), t0
+                    )
+
+            c_ts = c_id = None
+            if cursor:
+                try:
+                    c_ts, c_id = decode_cursor(cursor)
+                except Exception:
+                    return _with_latency(_error_response("INVALID_ARGUMENTS", "Invalid cursor."), t0)
+
+            # Cross-tenant credentials widen via ``readable_tenant_ids`` —
+            # the gateway plumbs ``X-Readable-Tenant-IDs`` into the MCP
+            # context var. ``scope='all'`` aggregates across the widened set;
+            # ``scope='agent'`` still filters to the caller's own writes
+            # in the home tenant. Single-tenant credentials leave the var
+            # empty; storage falls back to ``tenant_id = $1``. Request
+            # ``limit + 1`` so we detect ``has_more`` + build the next cursor.
+            readable = _get_readable_tenants() or None
+            list_payload: dict[str, Any] = {
+                "tenant_id": tenant_id,
+                "caller_agent_id": agent_id,
+                "fleet_id": fleet_id,
+                "written_by": effective_written_by,
+                "memory_type": memory_type,
+                "status": status,
+                "weight_min": weight_min,
+                "weight_max": weight_max,
+                "created_after": ts_after.isoformat() if ts_after else None,
+                "created_before": ts_before.isoformat() if ts_before else None,
+                "include_deleted": effective_include_deleted,
+                "sort": sort,
+                "order": order,
+                "limit": capped_limit,
+                "cursor_ts": c_ts.isoformat() if c_ts else None,
+                "cursor_id": str(c_id) if c_id else None,
+                "readable_tenant_ids": readable if scope != "agent" else None,
+            }
+            rows = await get_storage_client().list_memories_by_filters(list_payload)
+            has_more = len(rows) > capped_limit
+            # ``_memory_to_out`` accepts either an ORM row or a storage dict.
+            items = [_memory_to_out(m).model_dump(mode="json") for m in rows[:capped_limit]]
+            next_cursor = None
+            if has_more and rows:
+                last = rows[capped_limit - 1]
+                next_cursor = encode_cursor(_dt.fromisoformat(last["created_at"]), UUID(last["id"]))
+            # Cross-tenant audit (F2): count per tenant from the served rows.
+            source_tenants = [t for t in (readable or []) if t and t != tenant_id]
+            if source_tenants:
+                counts: dict[str, int] = {}
+                for row in rows[:capped_limit]:
+                    rt = row.get("tenant_id")
+                    if rt:
+                        counts[rt] = counts.get(rt, 0) + 1
+                await log_cross_tenant_read(
+                    home_tenant_id=tenant_id,
+                    home_agent_id=agent_id,
+                    source_tenants=source_tenants,
+                    surface="memclaw_list",
+                    result_count_by_tenant=counts,
+                )
+            return _with_latency(
+                json.dumps(
+                    {"count": len(items), "results": items, "next_cursor": next_cursor, "scope": scope},
+                    default=str,
+                ),
+                t0,
+            )
+        except HTTPException as e:
+            logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+        except httpx.HTTPStatusError as e:
+            return _storage_error_envelope(e, t0)
+        except Exception as e:
+            logger.error("MCP list error: %s", e, exc_info=True)
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+async def memclaw_stats(
+    scope: Annotated[
+        str,
+        Field(
+            description="agent|fleet|all. 'agent' (default) = your memories only (trust ≥ 1). 'fleet'/'all' = aggregate across agents (trust ≥ 2)."
+        ),
+    ] = "agent",
+    fleet_id: Annotated[str | None, Field(description="Filter by fleet.")] = None,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    memory_type: Annotated[str | None, Field(description="Filter by type.")] = None,
+    status: Annotated[str | None, Field(description="Filter by status.")] = None,
+    include_deleted: Annotated[
+        bool,
+        Field(
+            description="When true, also return 'deleted' (soft-deleted count) and 'total_including_deleted'. 'total' and breakdowns stay non-deleted regardless."
+        ),
+    ] = False,
+) -> str:
+    """Aggregate counts: total plus breakdowns by type, agent, status.
+    scope='agent' (default) requires trust ≥ 1; scope='fleet'/'all' requires
+    trust ≥ 2. scope='agent' counts only memories visible to the caller (mirrors
+    memclaw_list visibility scoping); broader scopes drop the per-caller filter.
+    Counts exclude soft-deleted memories by default; pass include_deleted=true
+    for additional 'deleted' and 'total_including_deleted' fields."""
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if scope not in VALID_SCOPES:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all."),
+            t0,
+        )
+    if memory_type and memory_type not in MEMORY_TYPES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}",
+            ),
+            t0,
+        )
+    if status and status not in MEMORY_STATUSES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+            ),
+            t0,
+        )
+
+    tenant_id = _get_tenant()
+    agent_id = _get_agent_id() or agent_id
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+    min_level = 1 if scope == "agent" else 2
+
+    # ``_require_trust`` is storage-routed; ``compute_memory_stats`` (db-bound
+    # GROUPING SETS) becomes the storage client's ``memory_stats_breakdown``
+    # (ported verbatim into PostgresService — same visibility scoping, GROUPING
+    # SETS, ``by_tenant`` widening, and ``include_deleted`` CTE). ``_no_db()`` ⇒
+    # db=None. Tenant isolation: scope='agent' pins the read to the HOME tenant
+    # and to the caller's own visibility (``agent_id`` doubles as the visibility
+    # identity); scope='fleet'/'all' widens via ``readable_tenant_ids`` exactly
+    # as before.
+    async with _no_db():
+        trust, _, terr = await _require_trust(tenant_id, agent_id, min_level=min_level)
+        if terr:
+            return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+
+        # scope='agent' filters to caller's own memories (mirrors memclaw_list);
+        # scope='fleet'/'all' drops the per-caller filter so cross-agent
+        # aggregates surface — fleet_id (if supplied) still narrows the pool.
+        effective_agent_id = agent_id if scope == "agent" else None
+        effective_include_deleted = include_deleted and trust >= 3
+
+        try:
+            # Cross-tenant credentials with scope='fleet'/'all' aggregate
+            # across the widened readable set; scope='agent' stays
+            # home-only because per-agent stats are intrinsically tied
+            # to the home tenant identity.
+            readable = _get_readable_tenants() or None
+            stats = await get_storage_client().memory_stats_breakdown(
+                {
+                    "tenant_id": tenant_id,
+                    "fleet_id": fleet_id,
+                    "agent_id": effective_agent_id,
+                    "memory_type": memory_type,
+                    "status": status,
+                    "include_deleted": effective_include_deleted,
+                    "readable_tenant_ids": readable if scope != "agent" else None,
+                }
+            )
+            source_tenants = [t for t in (readable or []) if t and t != tenant_id]
+            if source_tenants and scope != "agent":
+                # by_tenant breakdown is already in stats — reuse for the audit.
+                await log_cross_tenant_read(
+                    home_tenant_id=tenant_id,
+                    home_agent_id=agent_id,
+                    source_tenants=source_tenants,
+                    surface="memclaw_stats",
+                    result_count_by_tenant=stats.get("by_tenant") or {},
+                )
+            return _with_latency(json.dumps({**stats, "scope": scope}, default=str), t0)
+        except Exception as e:
+            logger.exception("Unhandled error in memclaw_stats")
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+# ---------------------------------------------------------------------------
+# Intelligence tools (Karpathy Loop)
+# ---------------------------------------------------------------------------
+
+
+async def memclaw_insights(
+    focus: Annotated[
+        str,
+        Field(
+            description="contradictions|failures|stale|divergence|patterns|discover.",
+        ),
+    ],
+    scope: Annotated[str, Field(description="agent|fleet|all.")] = "agent",
+    fleet_id: Annotated[str | None, Field(description="Required when scope='fleet'.")] = None,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+) -> str:
+    """Analyze the memory store for patterns, contradictions, stale knowledge,
+    or unexpected clusters; persist findings as ``insight`` memories.
+    Consolidates onto the Karpathy Loop reflection step.
+    scope='agent' (default) requires trust ≥ 1; scope='fleet'/'all' requires
+    trust ≥ 2.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    tenant_id = _get_tenant()
+    agent_id = _get_agent_id() or agent_id
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+
+    # Pre-validate inputs before consuming rate-limit budget.
+    if focus not in INSIGHTS_FOCUS_MODES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid focus '{focus}'. Must be one of: {', '.join(INSIGHTS_FOCUS_MODES)}",
+            ),
+            t0,
+        )
+    if scope not in VALID_SCOPES:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all"), t0
+        )
+    if scope == "fleet" and not fleet_id:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "fleet_id is required when scope is 'fleet'."), t0
+        )
+    if focus == "divergence" and scope == "agent":
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "Focus 'divergence' requires scope='fleet' or scope='all'."),
+            t0,
+        )
+
+    # Dynamic trust: scope='agent' requires trust ≥ 1, 'fleet'/'all' requires ≥ 2.
+    min_level = 1 if scope == "agent" else 2
+
+    # Audit finding P3 (insights portion): the prior implementation held a
+    # single ``_mcp_session()`` open across the multi-second LLM analysis
+    # round-trip, pinning a pooled DB connection during work that is entirely
+    # network-bound to the LLM provider. The three-phase split is retained, and
+    # post-Fix-2-Ph5b every phase is storage-routed (no pooled connection held):
+    #   1. ``_no_db`` — trust + usage gates, query memories, resolve config
+    #   2. no DB      — synthesize_insights (LLM)
+    #   3. ``_no_db`` — persist findings (storage-routed; no commit)
+    from core_api.services.insights_service import (
+        _QUERY_DISPATCH,
+        _DiscoverResult,
+        _persist_findings,
+        synthesize_insights,
+    )
+    from core_api.services.organization_settings import resolve_config
+
+    try:
+        # ── Phase 1: gates + storage-routed reads ──────────────────
+        # Fix 2 Ph5b: the trust/usage gates and the analytic memory reads are
+        # storage-routed (``_no_db()`` ⇒ db=None) — ``_require_trust`` /
+        # ``check_and_increment`` ignore db and the ``_QUERY_DISPATCH`` fns
+        # call core-storage-api. No pooled DB connection is held.
+        async with _no_db():
+            # Mirror the REST insights gate: ``require_trust`` soft-passes
+            # a missing Agent row at ``DEFAULT_TRUST_LEVEL`` (read-only
+            # ergonomics — see ``memclaw_list`` below for the intended
+            # consumer), but this handler persists insight memories +
+            # audit-log rows keyed to ``agent_id``. Without a registered
+            # row backing the name, attribution becomes unverifiable, so
+            # re-block unregistered agents on the write path.
+            _, not_found, terr = await _require_trust(tenant_id, agent_id, min_level=min_level)
+            if not_found:
+                return _with_latency(
+                    _error_response(
+                        "FORBIDDEN",
+                        f"Agent '{agent_id}' is not registered. Register the agent by writing one memory first.",
+                    ),
+                    t0,
+                )
+            if terr:
+                return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+            await check_and_increment(tenant_id, "insights")
+            memories_or_clusters = await _QUERY_DISPATCH[focus](tenant_id, fleet_id, agent_id, scope)
+            if focus == "discover" and isinstance(memories_or_clusters, _DiscoverResult):
+                is_clustered = memories_or_clusters.is_clustered
+                memories_or_clusters = memories_or_clusters.data
+            else:
+                is_clustered = False
+            # Short-circuit when the query found no candidate memories —
+            # no LLM work, no second session, just a stable empty result.
+            if not memories_or_clusters:
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "focus": focus,
+                            "scope": scope,
+                            "memories_analyzed": 0,
+                            "findings": [],
+                            "summary": "No relevant memories found for this analysis.",
+                            "insight_memory_ids": [],
+                            "insights_ms": int((time.perf_counter() - t0) * 1000),
+                        },
+                        indent=2,
+                        default=str,
+                    ),
+                    t0,
+                )
+            config = await resolve_config(tenant_id)
+        # ── Session closed. The LLM analysis runs with no DB held. ──
+
+        # ── Phase 2: LLM (no DB) ───────────────────────────────────
+        synth = await synthesize_insights(
+            memories_or_clusters,
+            is_clustered,
+            config,
+            focus=focus,
+            scope=scope,
+        )
+        findings = synth["findings"]
+
+        # ── Phase 3: persist findings (storage-routed) ─────────────
+        # Fix 2 Ph5b: the supersede/restore + bulk-create inside
+        # ``_persist_findings`` are each storage-committed independently, so
+        # there's no session to open or commit here (``_no_db()`` ⇒ db=None).
+        async with _no_db():
+            insight_ids = await _persist_findings(tenant_id, agent_id, fleet_id, focus, scope, findings)
+
+        result = {
+            "focus": focus,
+            "scope": scope,
+            "memories_analyzed": synth["memories_analyzed"],
+            "findings": [{**f, "insight_memory_id": mid} for f, mid in zip(findings, insight_ids)],
+            "summary": synth["summary"],
+            "insight_memory_ids": [mid for mid in insight_ids if mid],
+            "insights_ms": int((time.perf_counter() - t0) * 1000),
+        }
+        return _with_latency(json.dumps(result, indent=2, default=str), t0)
+    except HTTPException as e:
+        return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+    except Exception as e:
+        logger.exception("Unhandled error in memclaw_insights")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+async def memclaw_evolve(
+    outcome: Annotated[str, Field(description="Natural-language description of what happened.")],
+    outcome_type: Annotated[str, Field(description="success|failure|partial.")],
+    related_ids: Annotated[
+        list[str] | None,
+        Field(description="Memory UUIDs that influenced the action."),
+    ] = None,
+    scope: Annotated[str, Field(description="agent|fleet|all.")] = "agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    fleet_id: Annotated[str | None, Field(description="Required when scope='fleet'.")] = None,
+) -> str:
+    """Record a real-world outcome against the memories that influenced the
+    action: adjust weights, generate preventive rules on failure. Closes the
+    Karpathy Loop feedback edge.
+
+    scope='agent' (default) requires trust ≥ 1 and limits adjustments to
+    memories the caller wrote. scope='fleet'/'all' requires trust ≥ 2.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if err := _check_write_scope():
+        return err
+    tenant_id = _get_tenant()
+    agent_id = _get_agent_id() or agent_id
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+
+    # Pre-validate inputs before consuming rate-limit budget.
+    if outcome_type not in EVOLVE_OUTCOME_TYPES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid outcome_type '{outcome_type}'. Must be one of: {', '.join(EVOLVE_OUTCOME_TYPES)}",
+            ),
+            t0,
+        )
+    if not outcome or not outcome.strip():
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "outcome must be a non-empty description."), t0
+        )
+    if scope not in VALID_SCOPES:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all."), t0
+        )
+    if scope == "fleet" and not fleet_id:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "fleet_id is required when scope is 'fleet'."), t0
+        )
+
+    # Dynamic trust: scope='agent' requires trust ≥ 1, 'fleet'/'all' requires ≥ 2.
+    min_level = 1 if scope == "agent" else 2
+
+    # Audit finding P3 (evolve portion): prior implementation held a
+    # single ``_mcp_session()`` open across the rule-generation LLM
+    # round-trip — multiple seconds during which a pooled DB connection
+    # was pinned for work that is entirely network-bound to the LLM
+    # provider. The three-phase split is retained, and post-Fix-2-Ph5b-PR2
+    # every phase is storage-routed (no pooled connection held):
+    #   1. ``_no_db`` — trust + usage gates, filter_by_scope, resolve_config
+    #   2. no DB      — _maybe_generate_rule (LLM)
+    #   3. ``_no_db`` — _apply_outcome_to_db (persist + weights + backfill;
+    #                   storage-committed, no local commit)
+    from core_api.services.evolve_service import (
+        _apply_outcome_to_db,
+        _filter_by_scope,
+        _log_weight_adjustment_skip,
+        _maybe_generate_rule,
+    )
+    from core_api.services.organization_settings import resolve_config
+
+    try:
+        # ── Phase 1: gates + storage-routed reads ──────────────────
+        # Fix 2 Ph5b (PR2): the trust/usage gates and the scope-filter read are
+        # storage-routed (``_no_db()`` ⇒ db=None) — ``_require_trust`` /
+        # ``check_and_increment`` ignore db and ``_filter_by_scope`` calls
+        # core-storage-api. No pooled DB connection is held.
+        async with _no_db():
+            # Mirror the REST evolve gate (and ``memclaw_insights`` above):
+            # block unregistered agents on the write path so the
+            # outcome/rule memories + audit-log rows have a real
+            # registered ``agent_id`` backing them.
+            _, not_found, terr = await _require_trust(tenant_id, agent_id, min_level=min_level)
+            if not_found:
+                return _with_latency(
+                    _error_response(
+                        "FORBIDDEN",
+                        f"Agent '{agent_id}' is not registered. Register the agent by writing one memory first.",
+                    ),
+                    t0,
+                )
+            if terr:
+                return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+            await check_and_increment(tenant_id, "evolve")
+
+            # A15: classify why no weights will move, mirroring the REST
+            # report_outcome path. _apply_outcome_to_db requires this slug;
+            # the MCP path previously omitted it, raising a TypeError on the
+            # write path (prod incident). A deeper stage (_adjust_weights
+            # race / DB failure) may still override it.
+            in_scope_ids = related_ids or []
+            out_of_scope_count = 0
+            weight_adjustment_skipped_reason: str | None = None
+            if not in_scope_ids:
+                weight_adjustment_skipped_reason = "no_related_ids"
+            else:
+                original_count = len(in_scope_ids)
+                in_scope_ids, out_of_scope_count = await _filter_by_scope(
+                    tenant_id=tenant_id,
+                    caller_agent_id=agent_id,
+                    fleet_id=fleet_id,
+                    scope=scope,
+                    related_ids=in_scope_ids,
+                )
+                if not in_scope_ids and out_of_scope_count >= original_count:
+                    # Filter dropped everything. Map scope → slug.
+                    weight_adjustment_skipped_reason = {
+                        "agent": "agent_id_mismatch",
+                        "fleet": "fleet_id_mismatch",
+                        "all": "all_out_of_scope",
+                    }.get(scope, "all_out_of_scope")
+                    _log_weight_adjustment_skip(
+                        weight_adjustment_skipped_reason,
+                        tenant_id,
+                        scope,
+                        out_of_scope_count=out_of_scope_count,
+                        caller_agent_id=agent_id,
+                        fleet_id=fleet_id,
+                    )
+            config = await resolve_config(tenant_id)
+        # ── Session closed. The LLM rule generation runs with no DB held. ──
+
+        # ── Phase 2: LLM (no DB) ───────────────────────────────────
+        rule_result, rule_skipped_reason = await _maybe_generate_rule(
+            tenant_id,
+            outcome,
+            outcome_type,
+            in_scope_ids,
+            config,
+            agent_id,
+            fleet_id,
+        )
+
+        # ── Phase 3: persist (storage-routed) ──────────────────────
+        # Fix 2 Ph5b (PR2): the rule/outcome create_memory writes + the atomic
+        # weight-adjust/backfill all route through core-storage-api, so there's
+        # no session to open or commit here (``_no_db()`` ⇒ db=None).
+        async with _no_db():
+            result = await _apply_outcome_to_db(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                fleet_id=fleet_id,
+                outcome=outcome,
+                outcome_type=outcome_type,
+                related_ids=in_scope_ids,
+                rule_result=rule_result,
+                rule_skipped_reason=rule_skipped_reason,
+                scope=scope,
+                out_of_scope_count=out_of_scope_count,
+                weight_adjustment_skipped_reason=weight_adjustment_skipped_reason,
+                t0=t0,
+            )
+        return _with_latency(json.dumps(result, indent=2, default=str), t0)
+    except HTTPException as e:
+        return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+    except Exception as e:
+        logger.exception("Unhandled error in memclaw_evolve")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# memclaw_keystones / memclaw_keystones_set — CAURA-000
+# ──────────────────────────────────────────────────────────────────────
+#
+# Keystones are mandatory governance rules. They live in core-storage
+# under the system-managed ``_keystones`` collection (PR1); this layer
+# wraps them in MCP tools and a REST surface (route file
+# ``routes/keystones.py``).
+#
+# Two separate handlers (not op-dispatched into one) because:
+#   * Different audiences — agents READ keystones at session start,
+#     admins/governance AUTHOR them. Surfacing them as two named tools
+#     keeps the read tool discoverable in ``instructions`` without the
+#     write surface bleeding into low-trust contexts.
+#   * Different trust profiles. Read is open (``trust_required=0``).
+#     Write declares ``trust_required=1`` as the minimum any successful
+#     call needs, then the handler computes the per-call floor from
+#     the rule's scope/agent_id: ``scope=agent`` for the caller's own
+#     agent_id is the self-author tier (≥1); everything else
+#     (``scope=fleet``, ``scope=tenant``, or cross-agent ``scope=agent``)
+#     stays at the cross-agent governance bar (≥2). The ≥2 tier is what
+#     blocks a prompt-injected freshly-registered agent from planting
+#     a tenant-wide rule or impersonating another agent.
+
+
+async def memclaw_keystones(
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    fleet_id: Annotated[
+        str | None,
+        Field(description="Scope filter; supply to include fleet- and agent-scoped rules."),
+    ] = None,
+) -> str:
+    """Retrieve the scope-merged set of keystone rules for the caller.
+
+    Returns ``{"count": N, "truncated": bool, "rules": [...]}`` — the
+    merged rule set lives under ``rules``. The field name is ``rules``
+    (not ``keystones``) for backwards compatibility with existing
+    clients; if you build a new integration, key off ``rules``.
+
+    Includes tenant + fleet + agent-scope rules ordered by weight.
+    Agents should call this once per session, surface the result as
+    mandatory rules, and obey them. Do not pass a query — there is no
+    semantic search here; the whole point of keystones is deterministic
+    retrieval.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    tenant_id = _get_tenant()
+    agent_id_effective = _get_agent_id() or agent_id
+    if refuse := _refuse_default_agent_on_gateway(agent_id_effective):
+        return _with_latency(refuse, t0)
+
+    sc = get_storage_client()
+    try:
+        rows, truncated = await sc.list_keystones(
+            tenant_id=tenant_id,
+            fleet_id=fleet_id,
+            agent_id=agent_id_effective if fleet_id else None,
+        )
+    except HTTPException as e:
+        return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+    except httpx.HTTPStatusError as e:
+        # storage_client raises this on non-2xx — surface the upstream
+        # status + detail so a 4xx from storage doesn't surface as a 500.
+        # Mirrors the catch in ``memclaw_keystones_set`` and the
+        # ``_surface_storage_error`` helper in ``routes/keystones.py``.
+        try:
+            detail = e.response.json()
+        except ValueError:
+            detail = e.response.text or str(e)
+        return _with_latency(
+            _error_response(code_for_status(e.response.status_code), str(detail)),
+            t0,
+        )
+    except Exception as e:
+        logger.exception("Unhandled error in memclaw_keystones")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+    return _with_latency(
+        json.dumps({"count": len(rows), "truncated": truncated, "rules": rows}, default=str),
+        t0,
+    )
+
+
+async def memclaw_keystones_set(
+    op: Annotated[str, Field(description="set|delete.")],
+    doc_id: Annotated[str, Field(description="Stable slug identifying the rule.")],
+    title: Annotated[str | None, Field(description="op=set: human-readable title.")] = None,
+    content: Annotated[str | None, Field(description="op=set: the rule text.")] = None,
+    scope: Annotated[str | None, Field(description="op=set: tenant|fleet|agent.")] = None,
+    weight: Annotated[str | None, Field(description="op=set: low|med|high.")] = None,
+    fleet_id: Annotated[
+        str | None, Field(description="op=set: required for scope=fleet|agent; omit for scope=tenant.")
+    ] = None,
+    agent_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "op=set: TARGET agent the rule binds to — required for "
+                "scope=agent, must be omitted for scope=tenant or scope=fleet. "
+                "This is NOT the caller's identity (which is derived from the "
+                "API key or gateway headers); it's the agent whose behaviour "
+                "the rule constrains."
+            ),
+        ),
+    ] = None,
+    author_user_id: Annotated[
+        str | None, Field(description="op=set: optional author identity for audit.")
+    ] = None,
+) -> str:
+    """Author or remove a keystone rule.
+
+    ``agent_id`` is the TARGET agent the rule binds to — not the
+    caller's identity. Caller identity comes from the API key or the
+    gateway-injected ``X-Agent-ID``. Pass ``agent_id`` only for
+    ``scope=agent``; passing it for ``scope=tenant`` or ``scope=fleet``
+    returns ``INVALID_ARGUMENTS``.
+
+    Trust gating is dynamic: ``scope=agent`` where the target
+    ``agent_id`` matches the caller is the self-author tier (trust ≥
+    1); everything else (``scope=fleet``, ``scope=tenant``, or
+    ``scope=agent`` targeting a different agent) stays at the
+    cross-agent governance bar (trust ≥ 2). Mirror of the REST policy
+    in ``routes/keystones.py``.
+
+    Use this rarely and deliberately — keystones override conflicting
+    user instructions and apply to every future session in scope.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if err := _check_write_scope():
+        return err
+    if op not in {"set", "delete"}:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Unknown op '{op}'. Expected set|delete."),
+            t0,
+        )
+    if not doc_id:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", "doc_id is required."), t0)
+    # Slug shape mirrors KeystoneSetRequest.doc_id in routes/keystones.py
+    # (filesystem-safe identifier). Validate here as well so MCP callers
+    # get the same constraint as REST callers — the regex isn't applied
+    # by Pydantic on this surface.
+    # ``re.fullmatch`` anchors both ends implicitly — no ^/$ needed. The
+    # error message keeps the anchored form because that's how the
+    # equivalent Pydantic ``Field(pattern=...)`` in routes/keystones.py
+    # advertises the constraint to API clients.
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", doc_id):
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                "doc_id must match ^[a-z0-9][a-z0-9._-]{0,99}$ (filesystem-safe identifier).",
+            ),
+            t0,
+        )
+
+    tenant_id = _get_tenant()
+    caller_agent_id = _get_agent_id() or "mcp-agent"
+    if refuse := _refuse_default_agent_on_gateway(caller_agent_id):
+        return _with_latency(refuse, t0)
+
+    # Already storage-routed for the keystone CRUD (``sc.get_document`` /
+    # ``upsert_keystone`` / ``delete_keystone``); Fix 2 Phase 4 only drops the
+    # residual ``_mcp_session`` (``_no_db()`` ⇒ db=None) since ``_require_trust``
+    # is storage-routed, ``log_action`` / ``check_and_increment`` ignore the
+    # ``db`` arg (audit queue / usage stub), and the keystone writes commit
+    # storage-side — so the ``db.commit()`` calls are gone. Tenant isolation is
+    # unchanged: every keystone op is scoped to the explicit home ``tenant_id``
+    # (writes never widen to a readable set).
+    async with _no_db():
+        # The whole body sits inside the try so the catch-all also covers
+        # ``_require_trust`` and the trust-error return paths — any of which can
+        # raise errors that aren't ``HTTPStatusError`` or ``HTTPException``.
+        # Mirrors memclaw_keystones' fallback.
+        try:
+            sc = get_storage_client()
+
+            if op == "set":
+                # Surface missing fields BEFORE the trust gate so we can
+                # compute ``min_level`` from a non-None ``scope``. We
+                # check ``is None`` (not ``not v``) so an explicit empty
+                # string falls through to storage's ``min_length=1``
+                # check and surfaces the correct error.
+                required = {
+                    "title": title,
+                    "content": content,
+                    "scope": scope,
+                    "weight": weight,
+                }
+                missing = [k for k, v in required.items() if v is None]
+                if missing:
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS",
+                            f"op=set requires: {', '.join(missing)}.",
+                        ),
+                        t0,
+                    )
+
+                # ONE trust round-trip — mirrors the op=delete path.
+                # Ask ``_require_trust`` for the anti-probing minimum (1)
+                # and reuse the returned ``trust`` value for the in-memory
+                # floor check after the storage lookup. This collapses
+                # two DB queries into one while preserving both the
+                # registration-check guarantee (so an unregistered caller
+                # can't probe doc_id existence via sc.get_document) and
+                # the scope-derived floor check.
+                trust, early_not_found, _early_terr = await _require_trust(
+                    tenant_id, caller_agent_id, min_level=1
+                )
+                if early_not_found:
+                    return _with_latency(
+                        _error_response(
+                            "FORBIDDEN",
+                            f"Agent '{caller_agent_id}' is not registered. "
+                            "Register the agent by writing one memory first.",
+                        ),
+                        t0,
+                    )
+                if _early_terr:
+                    return _with_latency(
+                        _error_response("FORBIDDEN", parse_trust_error(_early_terr)),
+                        t0,
+                    )
+
+                # Look up the existing rule (if any) so the trust floor
+                # combines the NEW body shape and the STORED shape.
+                # Without this, a trust-1 agent could overwrite a
+                # ``scope=fleet`` rule by submitting
+                # ``scope=agent``+``agent_id=<self>`` — the new-shape
+                # floor (1) would pass the gate and storage would
+                # upsert unconditionally. Mirrors the REST upsert.
+                existing = await sc.get_document(
+                    tenant_id=tenant_id,
+                    collection="_keystones",
+                    doc_id=doc_id,
+                )
+                existing_data = (existing or {}).get("data") or {}
+                # ``cast`` is a static-only hint (no runtime branch — unlike
+                # ``assert``, which becomes a no-op under ``python -O``).
+                # ``scope`` is guaranteed non-None by the required-fields
+                # check above; this just makes that visible to mypy.
+                new_scope_str = cast("str", scope)
+                min_level = effective_keystone_min_trust(
+                    new_scope=new_scope_str,
+                    new_target_agent_id=agent_id,
+                    stored_scope=existing_data.get("scope") if existing else None,
+                    stored_target_agent_id=existing_data.get("agent_id") if existing else None,
+                    caller_agent_id=caller_agent_id,
+                )
+                if trust < min_level:
+                    return _with_latency(
+                        _error_response(
+                            "FORBIDDEN",
+                            f"Agent '{caller_agent_id}' (trust_level={trust}) < required {min_level}.",
+                        ),
+                        t0,
+                    )
+                # TOCTOU narrowing: re-fetch the stored row immediately
+                # before the upsert and abort if the shape changed. A
+                # legitimate concurrent upsert could otherwise promote
+                # the stored scope between the gate read and the write
+                # below, letting a caller authorised for the looser
+                # earlier shape overwrite a stricter rule. Window is
+                # now reduced to (recheck → write), matching the delete
+                # path; storage-side conditional upsert remains the
+                # proper fix.
+                recheck = await sc.get_document(tenant_id=tenant_id, collection="_keystones", doc_id=doc_id)
+                recheck_data = (recheck or {}).get("data") or {}
+                if (existing is None) != (recheck is None) or (
+                    existing is not None
+                    and recheck is not None
+                    and (
+                        recheck_data.get("scope") != existing_data.get("scope")
+                        or recheck_data.get("agent_id") != existing_data.get("agent_id")
+                    )
+                ):
+                    return _with_latency(
+                        _error_response(
+                            "CONFLICT",
+                            "Keystone scope changed during operation; aborting upsert.",
+                        ),
+                        t0,
+                    )
+
+                # Bump the tenant's write quota — matches every other MCP
+                # write handler (memclaw_write/doc/manage/evolve). OSS
+                # impl is a no-op; enterprise can wire real metering
+                # without touching this call site. Skipped for op=delete
+                # because deletes don't charge the write budget (mirrors
+                # the REST route skipping ``enforce_usage_limits`` on
+                # DELETE).
+                await check_and_increment(tenant_id, "write")
+                # Storage owns scope/weight/fleet/agent shape validation;
+                # surface its 422s directly so we don't drift from the
+                # canonical error list.
+                #
+                # Build the TypedDict explicitly so mypy catches missing
+                # required fields. Optional fields are only added when
+                # set (rather than included as None) because storage
+                # rejects e.g. ``"fleet_id": null`` for ``scope=tenant``
+                # ("scope=tenant must not include fleet_id") — mirrors
+                # the REST path's ``exclude_none=True`` behaviour.
+                payload: KeystoneUpsertPayload = {
+                    "tenant_id": tenant_id,
+                    "doc_id": doc_id,
+                    "title": title,
+                    "content": content,
+                    "scope": scope,  # type: ignore[typeddict-item]
+                    "weight": weight,  # type: ignore[typeddict-item]
+                }
+                if fleet_id is not None:
+                    payload["fleet_id"] = fleet_id
+                if agent_id is not None:
+                    payload["agent_id"] = agent_id
+                if author_user_id is not None:
+                    payload["author_user_id"] = author_user_id
+                doc = await sc.upsert_keystone(payload)
+                await log_action(
+                    tenant_id=tenant_id,
+                    agent_id=caller_agent_id,
+                    action="keystone.set",
+                    resource_type="keystone",
+                    resource_id=doc.get("id") if isinstance(doc, dict) else None,
+                    detail={
+                        "doc_id": doc_id,
+                        "scope": scope,
+                        "fleet_id": fleet_id,
+                        "agent_id": agent_id,
+                        "weight": weight,
+                        "author_user_id": author_user_id,
+                        "via": "mcp",
+                    },
+                )
+                return _with_latency(
+                    json.dumps({"ok": True, "action": "set", "doc_id": doc_id}, default=str),
+                    t0,
+                )
+            # op == "delete"
+            # ONE trust round-trip for both the pre-lookup registration
+            # check (≥ 1, anti-probing — collapses 404 vs. 403 leak so
+            # unregistered callers can't probe ``doc_id`` existence)
+            # and the post-lookup floor check. Ask ``_require_trust``
+            # for the minimum the caller could possibly need (1), then
+            # compare the returned trust level against the scope-derived
+            # floor below.
+            trust, not_found, terr = await _require_trust(tenant_id, caller_agent_id, min_level=1)
+            if not_found:
+                return _with_latency(
+                    _error_response(
+                        "FORBIDDEN",
+                        f"Agent '{caller_agent_id}' is not registered. "
+                        "Register the agent by writing one memory first.",
+                    ),
+                    t0,
+                )
+            if terr:
+                return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+
+            # Look up the rule so the floor check sees the stored
+            # ``scope`` + ``agent_id`` rather than trusting any caller
+            # assertion. The documents-store GET ignores the system-
+            # collection guard (it only fires on write/delete), so this
+            # needs no new storage endpoint.
+            existing = await sc.get_document(tenant_id=tenant_id, collection="_keystones", doc_id=doc_id)
+            if not existing:
+                return _with_latency(
+                    _error_response("NOT_FOUND", f"Keystone '{doc_id}' not found."),
+                    t0,
+                )
+            existing_data = existing.get("data") or {}
+            min_level = keystone_min_trust(
+                existing_data.get("scope", ""),
+                existing_data.get("agent_id"),
+                caller_agent_id,
+            )
+            if trust < min_level:
+                return _with_latency(
+                    _error_response(
+                        "FORBIDDEN",
+                        f"Agent '{caller_agent_id}' (trust_level={trust}) < required {min_level}.",
+                    ),
+                    t0,
+                )
+
+            # TOCTOU narrowing: re-fetch the stored row immediately
+            # before the delete and abort if the shape changed. Without
+            # this, a legitimate concurrent upsert can promote a
+            # ``scope=agent`` rule to ``scope=fleet`` between the first
+            # read and the storage delete, letting a trust-1 caller
+            # delete a now-fleet rule it was never authorised for. The
+            # remaining race window (recheck → delete) is a single
+            # storage round-trip; the proper fix is a storage-side
+            # compare-and-delete with preconditions. Mirrors the REST
+            # delete path.
+            recheck = await sc.get_document(tenant_id=tenant_id, collection="_keystones", doc_id=doc_id)
+            if not recheck:
+                return _with_latency(_error_response("NOT_FOUND", f"Keystone '{doc_id}' not found."), t0)
+            recheck_data = recheck.get("data") or {}
+            if recheck_data.get("scope") != existing_data.get("scope") or recheck_data.get(
+                "agent_id"
+            ) != existing_data.get("agent_id"):
+                return _with_latency(
+                    _error_response(
+                        "CONFLICT",
+                        "Keystone scope changed during operation; aborting delete.",
+                    ),
+                    t0,
+                )
+            deleted = await sc.delete_keystone(tenant_id=tenant_id, doc_id=doc_id)
+            if not deleted:
+                return _with_latency(_error_response("NOT_FOUND", f"Keystone '{doc_id}' not found."), t0)
+            await log_action(
+                tenant_id=tenant_id,
+                agent_id=caller_agent_id,
+                action="keystone.delete",
+                resource_type="keystone",
+                resource_id=None,
+                detail={"doc_id": doc_id, "via": "mcp"},
+            )
+            return _with_latency(json.dumps({"ok": True, "action": "delete", "doc_id": doc_id}), t0)
+        except httpx.HTTPStatusError as e:
+            # storage_client._post / _delete call raise_for_status(); a
+            # storage-side 422 (bad scope/weight) raises this — surface
+            # the upstream status + detail instead of crashing the tool.
+            # Mirrors routes/keystones.py:_surface_storage_error.
+            try:
+                detail = e.response.json()
+            except ValueError:
+                detail = e.response.text or str(e)
+            return _with_latency(
+                _error_response(code_for_status(e.response.status_code), str(detail)),
+                t0,
+            )
+        except HTTPException as e:
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+        except Exception as e:
+            logger.exception("Unhandled error in memclaw_keystones_set")
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+# ── Mountable app + lifespan ──
+
+_mcp_starlette_app = mcp.streamable_http_app()
+
+
+def get_mcp_app() -> ASGIApp:
+    return MCPAuthMiddleware(_mcp_starlette_app)
+
+
+@contextlib.asynccontextmanager
+async def mcp_lifespan():
+    """Run MCP session manager lifecycle. Enter during FastAPI lifespan."""
+    async with mcp.session_manager.run():
+        yield
+
+
+# ── SoT registration ──────────────────────────────────────────────────────
+# Triggers loading of every `core_api.tools.memclaw_*.py` spec module. Each
+# spec module registers itself in the REGISTRY and calls `mcp_register(mcp, spec)`
+# to wire the handler to FastMCP. This import must run AFTER the 16 handler
+# functions above are defined — spec modules reference them via
+# `core_api.mcp_server.memclaw_X` attribute lookup.
+# The `noqa: E402,F401` silences "module-level import not at top" and
+# "imported but unused" — both are intentional.
+from core_api import tools  # noqa: F401

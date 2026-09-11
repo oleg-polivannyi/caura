@@ -1,0 +1,121 @@
+apiVersion: v1
+items:
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"name":"memclaw-api","namespace":"memclaw"},"spec":{"ports":[{"port":8000,"targetPort":8000}],"selector":{"app":"memclaw-api"}}}
+    creationTimestamp: "2026-07-07T11:06:45Z"
+    name: memclaw-api
+    namespace: memclaw
+    resourceVersion: "20830805"
+    uid: 5386530d-475d-47c3-bddf-6f407798f7e6
+  spec:
+    clusterIP: 10.43.189.233
+    clusterIPs:
+    - 10.43.189.233
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      app: memclaw-api
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"name":"memclaw-pg","namespace":"memclaw"},"spec":{"ports":[{"port":5432,"targetPort":5432}],"selector":{"app":"memclaw-pg"}}}
+    creationTimestamp: "2026-07-07T11:14:33Z"
+    name: memclaw-pg
+    namespace: memclaw
+    resourceVersion: "20831357"
+    uid: 0156c600-72d4-4290-8a54-0e1bb8c93a79
+  spec:
+    clusterIP: 10.43.224.195
+    clusterIPs:
+    - 10.43.224.195
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - port: 5432
+      protocol: TCP
+      targetPort: 5432
+    selector:
+      app: memclaw-pg
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"name":"memclaw-redis","namespace":"memclaw"},"spec":{"ports":[{"port":6379,"targetPort":6379}],"selector":{"app":"memclaw-redis"}}}
+    creationTimestamp: "2026-07-07T11:14:33Z"
+    name: memclaw-redis
+    namespace: memclaw
+    resourceVersion: "20831378"
+    uid: 0db16ed3-10f7-46bd-a5a0-2298917e54fe
+  spec:
+    clusterIP: 10.43.157.32
+    clusterIPs:
+    - 10.43.157.32
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - port: 6379
+      protocol: TCP
+      targetPort: 6379
+    selector:
+      app: memclaw-redis
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"name":"memclaw-storage-api","namespace":"memclaw"},"spec":{"ports":[{"port":8002,"targetPort":8002}],"selector":{"app":"memclaw-storage-api"}}}
+    creationTimestamp: "2026-07-07T11:14:34Z"
+    name: memclaw-storage-api
+    namespace: memclaw
+    resourceVersion: "20831405"
+    uid: 2cc84c37-2e0c-490e-9828-08f23ffe323a
+  spec:
+    clusterIP: 10.43.153.19
+    clusterIPs:
+    - 10.43.153.19
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - port: 8002
+      protocol: TCP
+      targetPort: 8002
+    selector:
+      app: memclaw-storage-api
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+kind: List
+metadata:
+  resourceVersion: ""

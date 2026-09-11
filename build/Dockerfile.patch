@@ -1,0 +1,18 @@
+# Reproducible patch build for the custom MemClaw core-api image.
+#
+# Base : memclaw-core-api:v5  (the image currently deployed in k3s ns memclaw)
+# Patch: app/common/llm/providers/openai.py  ->  complete_json json_schema fallback
+#
+# The repo's app/ directory is the exact /app tree extracted from v5 (minus
+# Python bytecode caches), so COPY restores the whole tree deterministically
+# and only our patched file differs from the base image.
+#
+# Usage (on the host):
+#   docker build -f build/Dockerfile.patch -t memclaw-core-api:v6 .
+
+FROM memclaw-core-api:v5
+
+COPY --chown=appuser:appuser app/ /app/
+
+# Drop any bytecode caches so the patched sources are recompiled at startup.
+RUN find /app -type d -name __pycache__ -prune -exec rm -rf {} + || true
