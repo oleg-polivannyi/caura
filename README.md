@@ -5,7 +5,14 @@ Everything for our **custom MemClaw (CAURA) deployment** lives here, on the
 
 - Runs at: `https://memclaw.enpire.ru/mcp`
 - Host: `root@ne.enpire.ru`, k3s namespace `memclaw`
-- Deployed image: **`memclaw-core-api:v6`** (built from this repo)
+- Deployed image: **`memclaw-core-api:v3.8.1`** (upstream `backend-v3.8.1` + our patches)
+
+> **2026-09-12:** the live deployment was upgraded from our `backend-v2.19.0`
+> build (`memclaw-core-api:v6`) to **`backend-v3.8.1`** carrying the same three
+> patches, and the Postgres schema was migrated `033 -> 044`. See
+> [`MIGRATION-v3.8.1.md`](MIGRATION-v3.8.1.md) and the reproducible overlay in
+> [`build/v3.8.1/`](build/v3.8.1/). The `v2.19.0` material below (`app/`,
+> `build/Dockerfile.patch`, `local-edits/`) remains as the historical record.
 
 This branch is a faithful mirror of what actually runs, **with all our fixes
 already applied**, plus the scripts to rebuild and deploy it, plus the
@@ -19,10 +26,15 @@ individual fixes as readable patches.
 app/                        the deployed runtime source (/app from the container),
                             with all our fixes applied  (= the "fixed state")
 build/
-  Dockerfile.patch          the Dockerfile fragment (FROM v5 + copy app/ over)
+  Dockerfile.patch          the v2.19.0 Dockerfile fragment (FROM v5 + copy app/ over)
   rebuild.sh                build memclaw-core-api:v6 from v5 + app/, import into k3s
   deploy.sh                 switch the deployment to v6 + timeout, wait for rollout
   rollback.sh               switch back to v5
+  v3.8.1/                   CURRENT build: overlay of our 3 patched files onto
+                            upstream core-api:v3.8.1 + rebuild.sh (verifies + imports)
+MIGRATION-v3.8.1.md         CURRENT deployment record: patched v3.8.1 build, DB
+                            033->044 migration, new CORE_STORAGE_SHARED_SECRET
+                            requirement, storage-api worker-healthcheck fix, rollback
 manifests/                  k8s objects exported from the live cluster (secrets REDACTED)
 local-edits/                OUR fixes as standalone patches vs upstream (3 files) + README
 LOCAL-CUSTOMIZATIONS.md     full write-up: upstream identity + every local edit, and the diff
